@@ -6,6 +6,9 @@ import zipfile
 import re
 import shutil
 import logging
+import argparse
+import json
+import uuid
 import xml.etree.ElementTree as ET
 
 import geopandas as gpd
@@ -17,13 +20,15 @@ from rasterio.warp import reproject, Resampling
 from rasterio.merge import merge
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Optional, List, Tuple, Dict
+from logging.handlers import RotatingFileHandler
+from typing import Optional, List, Tuple, Dict, Any
 
 # ================= 服务器配置（按你给的） =================
 INPUT_DIR = r"D:\leixiang\D-InSAR\S1_Data"
 SHP_PATH = r"D:\leixiang\D-InSAR\GreatWall_Buffer\Hebei_Baoding_1km.shp"
 PROJECT_ROOT = r"D:\leixiang\D-InSAR"
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Output")
+OUTPUT_BASE_DIR = os.path.join(PROJECT_ROOT, "Output")
+OUTPUT_DIR = OUTPUT_BASE_DIR
 TEMP_DIR = os.path.join(OUTPUT_DIR, "Temp_Preprocessed")
 
 GPT_PATH = r"C:\Program Files\esa-snap\bin\gpt.exe"
@@ -49,6 +54,22 @@ OUTPUT_MM = True  # 输出毫米（PhaseToDisplacement 通常是米）
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def setup_logging(log_dir: str, run_id: str) -> None:
+    os.makedirs(log_dir, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    log_path = os.path.join(log_dir, f"pipeline_{run_id}.log")
+    file_handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
 
 
 XML_PREPROCESS = r"""<graph id="Graph">
@@ -247,13 +268,6 @@ XML_GEO_COH = r"""<graph id="Graph"><version>1.0</version>
 </graph>"""
 
 
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-
 def validate_environment() -> None:
     missing = []
     for path in [INPUT_DIR, SHP_PATH, GPT_PATH, SNAPHU_CMD]:
@@ -300,6 +314,35 @@ def run_gpt(xml_path: str, task_id: str, work_dir: Optional[str] = None) -> None
 
     if p.returncode != 0:
         raise RuntimeError(f"GPT 失败({task_id})，查看日志: {log_path}")
+
+
+def load_status(status_path: str) -> Dict[str, Any]:
+    if not os.path.exists(status_path):
+        return {}
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_status(status_path: str, data: Dict[str, Any]) -> None:
+    with open(status_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def compute_stats(arr: np.ndarray) -> Dict[str, float]:
+    valid = np.isfinite(arr)
+    if not np.any(valid):
+        return {"valid_ratio": 0.0}
+    data = arr[valid]
+    return {
+        "valid_ratio": float(valid.mean()),
+        "min": float(np.min(data)),
+        "max": float(np.max(data)),
+        "mean": float(np.mean(data)),
+        "std": float(np.std(data)),
+    }
 
 
 def remove_planar_ramp(disp: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -494,10 +537,12 @@ def run_pair(
     pair_name = f"{swath}_{m_date.strftime('%Y%m%d')}_{s_date.strftime('%Y%m%d')}"
     pair_dir = os.path.join(OUTPUT_DIR, pair_name)
     os.makedirs(pair_dir, exist_ok=True)
+    status_path = os.path.join(pair_dir, "status.json")
+    status = load_status(status_path)
 
     # Step1：Core IFG
     core_dim = os.path.join(pair_dir, "core_ifg.dim")
-    if not os.path.exists(core_dim):
+    if not os.path.exists(core_dim) or not status.get("core_ifg"):
         esd_node = ""
         pre_ifg = "Back-Geocoding"
         if USE_ESD:
@@ -523,6 +568,8 @@ def run_pair(
             xml_path,
         )
         run_gpt(xml_path, f"core_{pair_name}", work_dir=pair_dir)
+        status["core_ifg"] = True
+        save_status(status_path, status)
 
     # Step2：Filter + Subset + SnaphuExport
     subset_dim = os.path.join(pair_dir, "subset_ifg.dim")
@@ -530,7 +577,7 @@ def run_pair(
     snaphu_dir = find_snaphu_work_dir(pair_dir)
     is_step2_done = os.path.exists(subset_dim) and (snaphu_dir is not None)
 
-    if not is_step2_done:
+    if not is_step2_done or not status.get("subset_ifg"):
         create_xml_file(
             XML_STEP2_FILTER,
             {
@@ -543,6 +590,8 @@ def run_pair(
             xml_path,
         )
         run_gpt(xml_path, f"filter_{pair_name}", work_dir=pair_dir)
+        status["subset_ifg"] = True
+        save_status(status_path, status)
 
     snaphu_dir = find_snaphu_work_dir(pair_dir)
     if not snaphu_dir:
@@ -559,7 +608,7 @@ def run_pair(
     deep_unw = os.path.join(snaphu_dir, unw_name)
     out_unw = os.path.join(pair_dir, unw_name)
 
-    if not os.path.exists(out_unw):
+    if not os.path.exists(out_unw) or not status.get("snaphu"):
         conf = os.path.join(snaphu_dir, "snaphu.conf")
         fix_snaphu_conf(conf, snaphu_dir)
         width = get_width_from_hdr(phase_img.replace(".img", ".hdr"))
@@ -576,10 +625,12 @@ def run_pair(
         hdr_dst = out_unw.replace(".img", ".hdr")
         if os.path.exists(hdr_src):
             shutil.move(hdr_src, hdr_dst)
+        status["snaphu"] = True
+        save_status(status_path, status)
 
     # Step4：Export displacement & coherence
     disp_tif = os.path.join(OUTPUT_DIR, f"Result_{pair_name}_disp.tif")
-    if not os.path.exists(disp_tif):
+    if not os.path.exists(disp_tif) or not status.get("disp_export"):
         xml_path = os.path.join(pair_dir, "run_export_disp.xml")
         create_xml_file(
             XML_GEO_DISP,
@@ -592,12 +643,14 @@ def run_pair(
             xml_path,
         )
         run_gpt(xml_path, f"disp_{pair_name}", work_dir=pair_dir)
+        status["disp_export"] = True
+        save_status(status_path, status)
 
     # coherence band（失败则降级不掩膜）
     pair_date_str = f"{m_date.strftime('%d%b%Y')}_{s_date.strftime('%d%b%Y')}"
     coh_band = f"coh_{swath}_VV_{pair_date_str}"
     coh_tif = os.path.join(OUTPUT_DIR, f"Result_{pair_name}_coh.tif")
-    if not os.path.exists(coh_tif):
+    if not os.path.exists(coh_tif) or not status.get("coh_export"):
         xml_path = os.path.join(pair_dir, "run_export_coh.xml")
         create_xml_file(
             XML_GEO_COH,
@@ -611,6 +664,8 @@ def run_pair(
         )
         try:
             run_gpt(xml_path, f"coh_{pair_name}", work_dir=pair_dir)
+            status["coh_export"] = True
+            save_status(status_path, status)
         except Exception:
             coh_tif = None
 
@@ -619,9 +674,9 @@ def run_pair(
 
 def calc_cumulative(
     tif_pairs: List[Tuple[str, Optional[str]]], out_name: str
-) -> Optional[str]:
+) -> Tuple[Optional[str], Dict[str, float]]:
     if not tif_pairs:
-        return None
+        return None, {}
 
     with rasterio.open(tif_pairs[0][0]) as src0:
         ref_meta = src0.meta.copy()
@@ -714,12 +769,12 @@ def calc_cumulative(
     out_path = os.path.join(OUTPUT_DIR, out_name)
     with rasterio.open(out_path, "w", **ref_meta) as dst:
         dst.write(out, 1)
-    return out_path
+    return out_path, compute_stats(vert)
 
 
-def mosaic_results(tif_paths: List[str], out_name: str) -> Optional[str]:
+def mosaic_results(tif_paths: List[str], out_name: str) -> Tuple[Optional[str], Dict[str, float]]:
     if not tif_paths:
-        return None
+        return None, {}
     srcs = [rasterio.open(p) for p in tif_paths]
     mosaic, out_trans = merge(srcs)
     out_meta = srcs[0].meta.copy()
@@ -737,11 +792,38 @@ def mosaic_results(tif_paths: List[str], out_name: str) -> Optional[str]:
         dst.write(mosaic)
     for s in srcs:
         s.close()
-    return out_path
+    stats = compute_stats(mosaic[0]) if mosaic.size > 0 else {}
+    return out_path, stats
 
 
 def main() -> None:
-    setup_logging()
+    parser = argparse.ArgumentParser(description="D-InSAR pipeline")
+    parser.add_argument("--input-dir", default=INPUT_DIR)
+    parser.add_argument("--shp-path", default=SHP_PATH)
+    parser.add_argument("--project-root", default=PROJECT_ROOT)
+    parser.add_argument("--gpt-path", default=GPT_PATH)
+    parser.add_argument("--snaphu-cmd", default=SNAPHU_CMD)
+    parser.add_argument("--dem-tif-path", default=DEM_TIF_PATH)
+    parser.add_argument("--run-id", default=datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    parser.add_argument("--max-workers", type=int, default=MAX_CPU_TASKS)
+    args = parser.parse_args()
+
+    global INPUT_DIR, SHP_PATH, PROJECT_ROOT, OUTPUT_BASE_DIR, OUTPUT_DIR, TEMP_DIR
+    global GPT_PATH, SNAPHU_CMD, DEM_TIF_PATH, MAX_CPU_TASKS
+
+    INPUT_DIR = args.input_dir
+    SHP_PATH = args.shp_path
+    PROJECT_ROOT = args.project_root
+    GPT_PATH = args.gpt_path
+    SNAPHU_CMD = args.snaphu_cmd
+    DEM_TIF_PATH = args.dem_tif_path
+    MAX_CPU_TASKS = args.max_workers
+
+    OUTPUT_BASE_DIR = os.path.join(PROJECT_ROOT, "Output")
+    OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, args.run_id)
+    TEMP_DIR = os.path.join(OUTPUT_DIR, "Temp_Preprocessed")
+
+    setup_logging(os.path.join(OUTPUT_DIR, "logs"), args.run_id)
     validate_environment()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TEMP_DIR, exist_ok=True)
@@ -764,6 +846,7 @@ def main() -> None:
         return
 
     swath_final_tifs: List[str] = []
+    quality_report: Dict[str, Any] = {"run_id": args.run_id, "swaths": {}, "final": {}}
 
     for task in tasks:
         swath = task["swath"]
@@ -799,16 +882,24 @@ def main() -> None:
                     LOGGER.exception("❌ pair 失败: %s", e)
 
         tif_pairs = sorted(tif_pairs, key=lambda x: x[0])
-        swath_out = calc_cumulative(tif_pairs, f"Total_Subsidence_{swath}.tif")
+        swath_out, stats = calc_cumulative(tif_pairs, f"Total_Subsidence_{swath}.tif")
         if swath_out:
             LOGGER.info("🎉 条带累计完成: %s", swath_out)
             swath_final_tifs.append(swath_out)
+            quality_report["swaths"][swath] = {"path": swath_out, "stats": stats}
 
-    final = mosaic_results(swath_final_tifs, "Final_Combined_Subsidence_Vertical_Masked.tif")
+    final, final_stats = mosaic_results(
+        swath_final_tifs, "Final_Combined_Subsidence_Vertical_Masked.tif"
+    )
     if final:
         LOGGER.info("🏆 最终拼接完成: %s", final)
+        quality_report["final"] = {"path": final, "stats": final_stats}
     else:
         LOGGER.warning("未生成最终结果")
+
+    report_path = os.path.join(OUTPUT_DIR, "quality_report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(quality_report, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

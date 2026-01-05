@@ -10,6 +10,7 @@ import argparse
 import json
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from math import cos, radians
 
 import geopandas as gpd
 from shapely.geometry import Point
@@ -46,6 +47,8 @@ class PipelineConfig:
     dem_name: str
     use_esd: bool
     output_mm: bool
+    required_disk_gb: int
+    max_temporal_baseline_days: int
 
 
 # ================= 服务器配置（按你给的） =================
@@ -60,6 +63,8 @@ DEFAULT_MAX_CPU_TASKS = 2  # 并行 gpt/snaphu 的进程数（先跑通可改 1�
 DEFAULT_THREADS_PER_WORKER = 40  # 每个 GPT 进程线程
 DEFAULT_JVM_HEAP = "32G"  # 每个 GPT 进程堆
 DEFAULT_TILE_CACHE = "12G"
+DEFAULT_REQUIRED_DISK_GB = 500
+DEFAULT_MAX_TEMPORAL_BASELINE_DAYS = 60
 
 DEFAULT_INCIDENCE_ANGLE = 39.5
 DEFAULT_COHERENCE_THRESHOLD = 0.30
@@ -69,7 +74,7 @@ DEFAULT_TOPO_PHASE_CORRECTION = True  # 大气延迟线性修正（与高程线�
 DEFAULT_DEM_TIF_PATH = r"D:\leixiang\D-InSAR\DEM\dem.tif"
 
 # 精度向选项
-DEFAULT_DEM_NAME = "SRTM 1Sec HGT"  # 想和本地一致就改回 "SRTM 3Sec"
+DEFAULT_DEM_NAME = "Copernicus 30m Global DEM"  # 想和本地一致就改回 "SRTM 3Sec"
 DEFAULT_USE_ESD = True  # TOPS 配准增强
 DEFAULT_OUTPUT_MM = True  # 输出毫米（PhaseToDisplacement 通常是米）
 # =========================================================
@@ -202,7 +207,7 @@ XML_STEP2_FILTER = r"""<graph id="Graph">
   <node id="GoldsteinFilter"><operator>GoldsteinPhaseFiltering</operator>
     <sources><sourceProduct refid="TopoPhaseRemoval"/></sources>
     <parameters>
-      <alpha>1.0</alpha>
+      <alpha>0.8</alpha>
       <FFTSizeString>64</FFTSizeString>
       <windowSizeString>3</windowSizeString>
       <useCoherenceMask>false</useCoherenceMask>
@@ -218,8 +223,8 @@ XML_STEP2_FILTER = r"""<graph id="Graph">
     <sources><sourceProduct refid="Subset"/></sources>
     <parameters>
       <targetFolder>${targetFolder}</targetFolder>
-      <statCostMode>DEFO</statCostMode>
-      <initMethod>MCF</initMethod>
+      <statCostMode>SMOOTH</statCostMode>
+      <initMethod>MST</initMethod>
       <numberOfTileCols>10</numberOfTileCols>
       <numberOfTileRows>10</numberOfTileRows>
       <tileCostThreshold>500</tileCostThreshold>
@@ -300,6 +305,18 @@ def validate_environment(config: PipelineConfig) -> None:
         raise FileNotFoundError(f"缺少必要路径/可执行文件:\n{missing_str}")
     if config.topo_phase_correction and not os.path.exists(config.dem_tif_path):
         LOGGER.warning("未找到 DEM_TIF_PATH: %s，将跳过线性高程修正", config.dem_tif_path)
+    check_disk_space(config.project_root, config.required_disk_gb)
+
+
+def check_disk_space(path: str, required_gb: int) -> None:
+    if not os.path.exists(path):
+        path = os.path.dirname(path)
+    usage = shutil.disk_usage(path)
+    free_gb = usage.free / (1024**3)
+    if free_gb < required_gb:
+        raise RuntimeError(
+            f"磁盘剩余空间不足: {free_gb:.1f} GB < {required_gb} GB"
+        )
 
 
 def create_xml_file(template: str, replace_dict: Dict[str, str], out_path: str) -> None:
@@ -331,6 +348,7 @@ def run_gpt(
         str(config.threads_per_worker),
         "-c",
         config.tile_cache,
+        "-x",
     ]
 
     with open(log_path, "w", encoding="utf-8") as log:
@@ -376,6 +394,47 @@ def compute_stats(arr: np.ndarray) -> Dict[str, float]:
         "mean": float(np.mean(data)),
         "std": float(np.std(data)),
     }
+
+
+def parse_size_to_bytes(size_value: str) -> int:
+    match = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?B?)\s*$", size_value, re.I)
+    if not match:
+        raise ValueError(f"无法解析大小字符串: {size_value}")
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    if unit in ("K", "KB"):
+        factor = 1024
+    elif unit in ("M", "MB"):
+        factor = 1024**2
+    elif unit in ("G", "GB", ""):
+        factor = 1024**3
+    elif unit in ("T", "TB"):
+        factor = 1024**4
+    else:
+        raise ValueError(f"未知单位: {unit}")
+    return int(value * factor)
+
+
+def normalize_tile_cache(jvm_heap: str, tile_cache: str) -> str:
+    heap_bytes = parse_size_to_bytes(jvm_heap)
+    cache_bytes = parse_size_to_bytes(tile_cache)
+    if cache_bytes >= heap_bytes:
+        adjusted = int(heap_bytes * 0.6)
+        adjusted_gb = max(adjusted // (1024**3), 1)
+        return f"{adjusted_gb}G"
+    return tile_cache
+
+
+def read_incidence_angle(tif_path: str, fallback: float) -> float:
+    try:
+        with rasterio.open(tif_path) as src:
+            tags = src.tags()
+        for key in ("incidence_angle", "incidenceAngle", "INCIDENCE_ANGLE"):
+            if key in tags:
+                return float(tags[key])
+    except (ValueError, rasterio.errors.RasterioIOError):
+        return fallback
+    return fallback
 
 
 def remove_planar_ramp(
@@ -493,6 +552,19 @@ def analyze_all_subswaths(zip_path: str, shp_path: str):
     return tasks, wkt
 
 
+def build_sbas_pairs(
+    dated_files: List[Tuple[datetime.datetime, str]], max_baseline_days: int
+) -> List[Tuple[datetime.datetime, datetime.datetime]]:
+    pairs = []
+    for i, (m_date, _) in enumerate(dated_files):
+        for s_date, _ in dated_files[i + 1 :]:
+            if (s_date - m_date).days <= max_baseline_days:
+                pairs.append((m_date, s_date))
+            else:
+                break
+    return pairs
+
+
 def preprocess_one(
     config: PipelineConfig, zip_file: str, subswath: str, s_burst: int, e_burst: int
 ) -> str:
@@ -544,7 +616,17 @@ def fix_snaphu_conf(conf: str, work_dir: str) -> None:
     coh_name = os.path.basename(coh[0]) if coh else None
 
     new_lines = []
+    has_init_method = False
+    has_cost_thresh = False
     for l in lines:
+        if l.strip().startswith("INITMETHOD"):
+            new_lines.append("INITMETHOD MST\n")
+            has_init_method = True
+            continue
+        if l.strip().startswith("COSTTHRESH"):
+            new_lines.append("COSTTHRESH 600\n")
+            has_cost_thresh = True
+            continue
         if "NTILEROW" in l or "NTILECOL" in l:
             new_lines.append(l.split()[0] + " 1\n")
             continue
@@ -558,6 +640,11 @@ def fix_snaphu_conf(conf: str, work_dir: str) -> None:
                 new_lines.append(f"# {l.strip()}\n")
             continue
         new_lines.append(l)
+
+    if not has_init_method:
+        new_lines.append("INITMETHOD MST\n")
+    if not has_cost_thresh:
+        new_lines.append("COSTTHRESH 600\n")
 
     with open(conf, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
@@ -742,6 +829,11 @@ def calc_cumulative(
         LOGGER.warning("未找到 DEM_TIF_PATH，跳过线性高程修正")
 
     for disp_path, coh_path in tif_pairs:
+        incidence_angle = read_incidence_angle(disp_path, config.incidence_angle)
+        angle_cos = cos(radians(incidence_angle))
+        if angle_cos == 0:
+            angle_cos = cos(radians(config.incidence_angle))
+
         with rasterio.open(disp_path) as src:
             disp = np.full((h, w), np.nan, dtype=np.float32)
             reproject(
@@ -775,10 +867,11 @@ def calc_cumulative(
             )
 
         disp = remove_planar_ramp(disp, mask, config.orbital_ramp_removal)
+        disp = disp / angle_cos
 
         weights = np.ones((h, w), dtype=np.float32)
         if config.weighted_stacking and coh_path and os.path.exists(coh_path):
-            weights = coh
+            weights = np.square(np.clip(coh, 0.0, 1.0))
         weights[~mask] = 0.0
         disp[~mask] = np.nan
 
@@ -796,20 +889,18 @@ def calc_cumulative(
     else:
         cum = np.where(weight_sum > 0, cum, np.nan)
 
-    vert = cum / np.cos(np.deg2rad(config.incidence_angle))
-
     nodata = -9999.0
     if config.output_mm:
-        vert = vert * 1000.0
+        cum = cum * 1000.0
         out_name = out_name.replace(".tif", "_mm.tif")
 
-    out = np.where(np.isnan(vert), nodata, vert).astype(np.float32)
+    out = np.where(np.isnan(cum), nodata, cum).astype(np.float32)
 
     ref_meta.update(dtype=rasterio.float32, count=1, nodata=nodata, compress="deflate")
     out_path = os.path.join(config.output_dir, out_name)
     with rasterio.open(out_path, "w", **ref_meta) as dst:
         dst.write(out, 1)
-    return out_path, compute_stats(vert)
+    return out_path, compute_stats(cum)
 
 
 def mosaic_results(
@@ -848,11 +939,24 @@ def main() -> None:
     parser.add_argument("--dem-tif-path", default=DEFAULT_DEM_TIF_PATH)
     parser.add_argument("--run-id", default=datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_CPU_TASKS)
+    parser.add_argument(
+        "--max-temporal-baseline",
+        type=int,
+        default=DEFAULT_MAX_TEMPORAL_BASELINE_DAYS,
+        help="SBAS 网络最大时间基线（天）",
+    )
+    parser.add_argument(
+        "--required-disk-gb",
+        type=int,
+        default=DEFAULT_REQUIRED_DISK_GB,
+        help="磁盘预检所需最小剩余空间（GB）",
+    )
     args = parser.parse_args()
 
     output_base_dir = os.path.join(args.project_root, "Output")
     output_dir = os.path.join(output_base_dir, args.run_id)
     temp_dir = os.path.join(output_dir, "Temp_Preprocessed")
+    tile_cache = normalize_tile_cache(DEFAULT_JVM_HEAP, DEFAULT_TILE_CACHE)
     config = PipelineConfig(
         input_dir=args.input_dir,
         shp_path=args.shp_path,
@@ -865,7 +969,7 @@ def main() -> None:
         max_cpu_tasks=args.max_workers,
         threads_per_worker=DEFAULT_THREADS_PER_WORKER,
         jvm_heap=DEFAULT_JVM_HEAP,
-        tile_cache=DEFAULT_TILE_CACHE,
+        tile_cache=tile_cache,
         incidence_angle=DEFAULT_INCIDENCE_ANGLE,
         coherence_threshold=DEFAULT_COHERENCE_THRESHOLD,
         weighted_stacking=DEFAULT_WEIGHTED_STACKING,
@@ -875,9 +979,13 @@ def main() -> None:
         dem_name=DEFAULT_DEM_NAME,
         use_esd=DEFAULT_USE_ESD,
         output_mm=DEFAULT_OUTPUT_MM,
+        required_disk_gb=args.required_disk_gb,
+        max_temporal_baseline_days=args.max_temporal_baseline,
     )
 
     setup_logging(os.path.join(config.output_dir, "logs"), args.run_id)
+    if tile_cache != DEFAULT_TILE_CACHE:
+        LOGGER.info("调整 TILE_CACHE: %s -> %s", DEFAULT_TILE_CACHE, tile_cache)
     validate_environment(config)
     os.makedirs(config.output_dir, exist_ok=True)
     os.makedirs(config.temp_dir, exist_ok=True)
@@ -918,7 +1026,10 @@ def main() -> None:
             )
             pre_map[d] = preprocess_one(config, z, swath, s_burst, e_burst)
 
-        pairs = [(file_map[i][0], file_map[i + 1][0]) for i in range(len(file_map) - 1)]
+        pairs = build_sbas_pairs(file_map, config.max_temporal_baseline_days)
+        if not pairs:
+            LOGGER.warning("未生成任何配对，请检查 max_temporal_baseline 设置")
+            continue
         tif_pairs: List[Tuple[str, Optional[str]]] = []
 
         LOGGER.info("🚀 [Phase 2] 干涉计算并行（max_workers=%s）...", config.max_cpu_tasks)

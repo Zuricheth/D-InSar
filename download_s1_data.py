@@ -3,7 +3,6 @@ import logging
 import os
 import time
 import zipfile
-from netrc import NetrcParseError, netrc
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -108,22 +107,6 @@ def validate_zip(path: str, filename: str) -> None:
         logging.warning("ZIP 校验失败，删除并标记失败: %s (%s)", filename, exc)
         os.remove(path)
         raise
-
-
-def resolve_credentials(username: str, password: str) -> tuple[str, str]:
-    if username and password:
-        return username, password
-    try:
-        auth = netrc().authenticators("urs.earthdata.nasa.gov")
-        if not auth:
-            auth = netrc().authenticators("earthdata.nasa.gov")
-        if auth:
-            login, _, netrc_password = auth
-            if login and netrc_password:
-                return login, netrc_password
-    except (FileNotFoundError, NetrcParseError):
-        pass
-    return username, password
 
 
 def download_file(url: str, session: requests.Session, config: DownloadConfig) -> None:
@@ -246,10 +229,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     setup_logging()
     args = parse_args()
-    username, password = resolve_credentials(args.username, args.password)
+    # ================= 账号信息硬编码 =================
+    username = "zzzunrich"
+    password = "Lx520520520.@"
+    # ==========================
+    if not username:
+        username = args.username
+    if not password:
+        password = args.password
     if not username or not password:
         raise ValueError(
-            "请通过 --username/--password、环境变量或 ~/.netrc 提供 Earthdata 账号密码"
+            "请通过 --username/--password 或环境变量提供 Earthdata 账号密码"
         )
 
     config = DownloadConfig(

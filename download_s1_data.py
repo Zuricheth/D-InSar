@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import time
+import zipfile
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -99,13 +100,20 @@ def format_size(num_bytes: float) -> str:
 def download_file(url: str, session: requests.Session, config: DownloadConfig) -> None:
     filename = url.split("/")[-1]
     save_path = os.path.join(config.save_dir, filename)
+    temp_path = f"{save_path}.part"
 
-    existing_size = os.path.getsize(save_path) if os.path.exists(save_path) else 0
     min_valid_size = config.min_valid_size_gb * 1024**3
-    if 0 < existing_size < min_valid_size:
+    if os.path.exists(save_path) and os.path.getsize(save_path) >= min_valid_size:
+        logging.info("已存在，跳过: %s", filename)
+        return
+
+    existing_path = temp_path if os.path.exists(temp_path) else save_path
+    existing_size = os.path.getsize(existing_path) if os.path.exists(existing_path) else 0
+    if 0 < existing_size < min_valid_size and existing_path == save_path:
         logging.warning("发现疑似损坏文件，删除重下: %s", save_path)
         os.remove(save_path)
         existing_size = 0
+        existing_path = temp_path
 
     headers = {}
     if existing_size > 0:
@@ -120,22 +128,29 @@ def download_file(url: str, session: requests.Session, config: DownloadConfig) -
             resp = session.get(resp.url, stream=True, timeout=config.timeout_s)
         resp.raise_for_status()
 
+        if existing_size > 0 and resp.status_code != 206:
+            logging.warning("服务器不支持续传，重新下载: %s", filename)
+            existing_size = 0
+            existing_path = temp_path
+
         mode = "ab" if resp.status_code == 206 else "wb"
         total_size = int(resp.headers.get("content-length", 0)) + existing_size
         chunk_size = config.chunk_size_mb * 1024 * 1024
 
         downloaded = existing_size
         start_time = time.time()
-        with open(save_path, mode) as f:
+        last_log_time = start_time
+        with open(existing_path, mode) as f:
             for chunk in resp.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     continue
                 f.write(chunk)
                 downloaded += len(chunk)
 
-                if total_size > 0 and downloaded - existing_size >= 10 * 1024**2:
+                now = time.time()
+                if total_size > 0 and now - last_log_time >= 5:
                     percent = downloaded / total_size * 100
-                    speed = downloaded / max(time.time() - start_time, 1e-6) / 1024**2
+                    speed = downloaded / max(now - start_time, 1e-6) / 1024**2
                     logging.info(
                         "进度: %s %s/%s (%.1f%%, %.1f MB/s)",
                         filename,
@@ -144,7 +159,19 @@ def download_file(url: str, session: requests.Session, config: DownloadConfig) -
                         percent,
                         speed,
                     )
-                    existing_size = downloaded
+                    last_log_time = now
+
+    if os.path.exists(existing_path) and existing_path != save_path:
+        os.replace(existing_path, save_path)
+    try:
+        with zipfile.ZipFile(save_path) as zip_file:
+            bad_member = zip_file.testzip()
+            if bad_member:
+                raise zipfile.BadZipFile(f"坏文件成员: {bad_member}")
+    except zipfile.BadZipFile as exc:
+        logging.warning("ZIP 校验失败，删除并标记失败: %s (%s)", filename, exc)
+        os.remove(save_path)
+        raise
 
     logging.info("完成: %s", filename)
 

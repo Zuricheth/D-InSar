@@ -36,6 +36,10 @@ TILE_CACHE = "12G"
 
 INCIDENCE_ANGLE = 39.5
 COHERENCE_THRESHOLD = 0.30
+WEIGHTED_STACKING = True  # 相干性加权堆栈
+ORBITAL_RAMP_REMOVAL = True  # 轨道误差精炼（移除平面相位坡度）
+TOPO_PHASE_CORRECTION = True  # 大气延迟线性修正（与高程线性相关）
+DEM_TIF_PATH = r"D:\leixiang\D-InSAR\DEM\dem.tif"
 
 # 精度向选项
 DEM_NAME = "SRTM 1Sec HGT"  # 想和本地一致就改回 "SRTM 3Sec"
@@ -258,6 +262,8 @@ def validate_environment() -> None:
     if missing:
         missing_str = "\n".join(f"- {p}" for p in missing)
         raise FileNotFoundError(f"缺少必要路径/可执行文件:\n{missing_str}")
+    if TOPO_PHASE_CORRECTION and not os.path.exists(DEM_TIF_PATH):
+        LOGGER.warning("未找到 DEM_TIF_PATH: %s，将跳过线性高程修正", DEM_TIF_PATH)
 
 
 def create_xml_file(template: str, replace_dict: Dict[str, str], out_path: str) -> None:
@@ -294,6 +300,39 @@ def run_gpt(xml_path: str, task_id: str, work_dir: Optional[str] = None) -> None
 
     if p.returncode != 0:
         raise RuntimeError(f"GPT 失败({task_id})，查看日志: {log_path}")
+
+
+def remove_planar_ramp(disp: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if not ORBITAL_RAMP_REMOVAL:
+        return disp
+    rows, cols = np.indices(disp.shape)
+    valid = mask & np.isfinite(disp)
+    if valid.sum() < 10:
+        LOGGER.warning("有效像素不足，跳过轨道坡度移除")
+        return disp
+    x = cols[valid].ravel()
+    y = rows[valid].ravel()
+    z = disp[valid].ravel()
+    A = np.column_stack([x, y, np.ones_like(x)])
+    coeff, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
+    ramp = (coeff[0] * cols + coeff[1] * rows + coeff[2]).astype(disp.dtype)
+    return disp - ramp
+
+
+def linear_topo_phase_correction(
+    disp: np.ndarray, dem: np.ndarray, mask: np.ndarray
+) -> np.ndarray:
+    if not TOPO_PHASE_CORRECTION:
+        return disp
+    valid = mask & np.isfinite(disp) & np.isfinite(dem)
+    if valid.sum() < 10:
+        LOGGER.warning("有效像素不足，跳过高程相关线性修正")
+        return disp
+    x = dem[valid].ravel()
+    y = disp[valid].ravel()
+    slope, intercept = np.polyfit(x, y, 1)
+    correction = (slope * dem + intercept).astype(disp.dtype)
+    return disp - correction
 
 
 def get_date_from_zip(zip_path: str) -> Optional[datetime.datetime]:
@@ -590,7 +629,24 @@ def calc_cumulative(
         ref_trans = src0.transform
         h, w = src0.height, src0.width
 
-    cum = np.full((h, w), np.nan, dtype=np.float32)
+    cum = np.zeros((h, w), dtype=np.float32)
+    weight_sum = np.zeros((h, w), dtype=np.float32)
+
+    dem = None
+    if TOPO_PHASE_CORRECTION and os.path.exists(DEM_TIF_PATH):
+        with rasterio.open(DEM_TIF_PATH) as dem_src:
+            dem = np.full((h, w), np.nan, dtype=np.float32)
+            reproject(
+                source=rasterio.band(dem_src, 1),
+                destination=dem,
+                src_transform=dem_src.transform,
+                src_crs=dem_src.crs,
+                dst_transform=ref_trans,
+                dst_crs=ref_crs,
+                resampling=Resampling.bilinear,
+            )
+    elif TOPO_PHASE_CORRECTION:
+        LOGGER.warning("未找到 DEM_TIF_PATH，跳过线性高程修正")
 
     for disp_path, coh_path in tif_pairs:
         with rasterio.open(disp_path) as src:
@@ -620,8 +676,30 @@ def calc_cumulative(
                 )
             mask = coh >= COHERENCE_THRESHOLD
 
+        if dem is not None:
+            disp = linear_topo_phase_correction(disp, dem, mask)
+
+        disp = remove_planar_ramp(disp, mask)
+
+        weights = np.ones((h, w), dtype=np.float32)
+        if WEIGHTED_STACKING and coh_path and os.path.exists(coh_path):
+            weights = coh
+        weights[~mask] = 0.0
         disp[~mask] = np.nan
-        cum = np.where(np.isnan(cum), disp, cum + disp)
+
+        valid = np.isfinite(disp) & (weights > 0)
+        if WEIGHTED_STACKING:
+            cum[valid] += disp[valid] * weights[valid]
+            weight_sum[valid] += weights[valid]
+        else:
+            cum[valid] += disp[valid]
+            weight_sum[valid] += 1.0
+
+    if WEIGHTED_STACKING:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cum = np.where(weight_sum > 0, cum / weight_sum, np.nan)
+    else:
+        cum = np.where(weight_sum > 0, cum, np.nan)
 
     vert = cum / np.cos(np.deg2rad(INCIDENCE_ANGLE))
 

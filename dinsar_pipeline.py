@@ -49,6 +49,11 @@ class PipelineConfig:
     output_mm: bool
     required_disk_gb: int
     max_temporal_baseline_days: int
+    loop_closure_threshold_mm: float
+    atm_filter_block_size: int
+    jump_gradient_threshold: float
+    robust_estimation: bool
+    robust_mad_threshold: float
 
 
 # ================= 服务器配置（按你给的） =================
@@ -65,6 +70,11 @@ DEFAULT_JVM_HEAP = "32G"  # 每个 GPT 进程堆
 DEFAULT_TILE_CACHE = "12G"
 DEFAULT_REQUIRED_DISK_GB = 500
 DEFAULT_MAX_TEMPORAL_BASELINE_DAYS = 60
+DEFAULT_LOOP_CLOSURE_THRESHOLD_MM = 15.0
+DEFAULT_ATM_FILTER_BLOCK_SIZE = 32
+DEFAULT_JUMP_GRADIENT_THRESHOLD = 0.08
+DEFAULT_ROBUST_ESTIMATION = True
+DEFAULT_ROBUST_MAD_THRESHOLD = 3.0
 
 DEFAULT_INCIDENCE_ANGLE = 39.5
 DEFAULT_COHERENCE_THRESHOLD = 0.30
@@ -437,6 +447,62 @@ def read_incidence_angle(tif_path: str, fallback: float) -> float:
     return fallback
 
 
+def apply_atmospheric_filter(
+    disp: np.ndarray, mask: np.ndarray, block_size: int
+) -> np.ndarray:
+    if block_size <= 1:
+        return disp
+    h, w = disp.shape
+    bh = max(1, block_size)
+    bw = max(1, block_size)
+    pad_h = (bh - (h % bh)) % bh
+    pad_w = (bw - (w % bw)) % bw
+    padded = np.pad(disp, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=np.nan)
+    padded_mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
+    reshaped = padded.reshape((padded.shape[0] // bh, bh, padded.shape[1] // bw, bw))
+    mask_reshaped = padded_mask.reshape(
+        (padded_mask.shape[0] // bh, bh, padded_mask.shape[1] // bw, bw)
+    )
+    block_vals = np.where(mask_reshaped, reshaped, np.nan)
+    block_median = np.nanmedian(block_vals, axis=(1, 3))
+    expanded = np.repeat(np.repeat(block_median, bh, axis=0), bw, axis=1)
+    expanded = expanded[:h, :w]
+    return disp - expanded
+
+
+def build_reliability_mask(
+    disp: np.ndarray,
+    coherence: Optional[np.ndarray],
+    coherence_threshold: float,
+    gradient_threshold: float,
+) -> np.ndarray:
+    mask = np.ones(disp.shape, dtype=bool)
+    if coherence is not None:
+        mask &= coherence >= coherence_threshold
+    grad_x = np.abs(disp - np.roll(disp, 1, axis=1))
+    grad_y = np.abs(disp - np.roll(disp, 1, axis=0))
+    grad = np.maximum(grad_x, grad_y)
+    mask &= grad <= gradient_threshold
+    return mask
+
+
+def robust_weighted_stack(
+    disp_stack: np.ndarray,
+    weight_stack: np.ndarray,
+    mad_threshold: float,
+) -> np.ndarray:
+    median = np.nanmedian(disp_stack, axis=0)
+    mad = np.nanmedian(np.abs(disp_stack - median), axis=0)
+    mad = np.where(mad == 0, np.nan, mad)
+    deviation = np.abs(disp_stack - median)
+    valid = deviation <= (mad_threshold * mad)
+    weights = np.where(valid, weight_stack, 0.0)
+    weighted_sum = np.nansum(disp_stack * weights, axis=0)
+    weight_sum = np.nansum(weights, axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(weight_sum > 0, weighted_sum / weight_sum, np.nan)
+
+
 def remove_planar_ramp(
     disp: np.ndarray, mask: np.ndarray, enabled: bool
 ) -> np.ndarray:
@@ -565,6 +631,76 @@ def build_sbas_pairs(
     return pairs
 
 
+def load_disp_for_reference(
+    disp_path: str,
+    ref_shape: Tuple[int, int],
+    ref_transform,
+    ref_crs,
+    incidence_angle: float,
+) -> np.ndarray:
+    with rasterio.open(disp_path) as src:
+        disp = np.full(ref_shape, np.nan, dtype=np.float32)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=disp,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            resampling=Resampling.bilinear,
+        )
+    angle_cos = cos(radians(incidence_angle))
+    if angle_cos == 0:
+        angle_cos = cos(radians(DEFAULT_INCIDENCE_ANGLE))
+    return disp / angle_cos
+
+
+def filter_pairs_by_loop_closure(
+    pairs: List[Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]],
+    threshold_mm: float,
+) -> List[Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]]:
+    if len(pairs) < 3:
+        return pairs
+
+    with rasterio.open(pairs[0][2]) as src:
+        ref_shape = (src.height, src.width)
+        ref_transform = src.transform
+        ref_crs = src.crs
+
+    disp_cache: Dict[Tuple[datetime.datetime, datetime.datetime], np.ndarray] = {}
+    for m_date, s_date, disp_path, _ in pairs:
+        incidence_angle = read_incidence_angle(disp_path, DEFAULT_INCIDENCE_ANGLE)
+        disp_cache[(m_date, s_date)] = load_disp_for_reference(
+            disp_path, ref_shape, ref_transform, ref_crs, incidence_angle
+        )
+
+    pair_set = {(m_date, s_date) for m_date, s_date, _, _ in pairs}
+    dates = sorted({d for pair in pair_set for d in pair})
+    bad_pairs = set()
+    threshold_m = threshold_mm / 1000.0
+    for i, a in enumerate(dates):
+        for j in range(i + 1, len(dates)):
+            b = dates[j]
+            for k in range(j + 1, len(dates)):
+                c = dates[k]
+                triplet = (a, b), (b, c), (a, c)
+                if not all(pair in pair_set for pair in triplet):
+                    continue
+                disp_ab = disp_cache[(a, b)]
+                disp_bc = disp_cache[(b, c)]
+                disp_ac = disp_cache[(a, c)]
+                closure = disp_ab + disp_bc - disp_ac
+                valid = np.isfinite(closure)
+                if not np.any(valid):
+                    continue
+                score = np.nanmedian(np.abs(closure[valid]))
+                if score > threshold_m:
+                    bad_pairs.update(triplet)
+
+    filtered = [item for item in pairs if (item[0], item[1]) not in bad_pairs]
+    return filtered if filtered else pairs
+
+
 def preprocess_one(
     config: PipelineConfig, zip_file: str, subswath: str, s_burst: int, e_burst: int
 ) -> str:
@@ -658,7 +794,7 @@ def run_pair(
     m_dim: str,
     s_dim: str,
     wkt: str,
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]:
     pair_name = f"{swath}_{m_date.strftime('%Y%m%d')}_{s_date.strftime('%Y%m%d')}"
     pair_dir = os.path.join(config.output_dir, pair_name)
     os.makedirs(pair_dir, exist_ok=True)
@@ -794,7 +930,7 @@ def run_pair(
         except Exception:
             coh_tif = None
 
-    return disp_tif, coh_tif
+    return m_date, s_date, disp_tif, coh_tif
 
 
 def calc_cumulative(
@@ -811,6 +947,8 @@ def calc_cumulative(
 
     cum = np.zeros((h, w), dtype=np.float32)
     weight_sum = np.zeros((h, w), dtype=np.float32)
+    disp_stack: List[np.ndarray] = []
+    weight_stack: List[np.ndarray] = []
 
     dem = None
     if config.topo_phase_correction and os.path.exists(config.dem_tif_path):
@@ -845,8 +983,9 @@ def calc_cumulative(
                 dst_crs=ref_crs,
                 resampling=Resampling.bilinear,
             )
+        disp = disp / angle_cos
 
-        mask = np.ones((h, w), dtype=bool)
+        coherence = None
         if coh_path and os.path.exists(coh_path):
             with rasterio.open(coh_path) as src:
                 coh = np.zeros((h, w), dtype=np.float32)
@@ -859,7 +998,14 @@ def calc_cumulative(
                     dst_crs=ref_crs,
                     resampling=Resampling.bilinear,
                 )
-            mask = coh >= config.coherence_threshold
+            coherence = coh
+
+        mask = build_reliability_mask(
+            disp,
+            coherence,
+            config.coherence_threshold,
+            config.jump_gradient_threshold,
+        )
 
         if dem is not None:
             disp = linear_topo_phase_correction(
@@ -867,27 +1013,40 @@ def calc_cumulative(
             )
 
         disp = remove_planar_ramp(disp, mask, config.orbital_ramp_removal)
-        disp = disp / angle_cos
+        disp = apply_atmospheric_filter(
+            disp, mask, config.atm_filter_block_size
+        )
 
         weights = np.ones((h, w), dtype=np.float32)
-        if config.weighted_stacking and coh_path and os.path.exists(coh_path):
-            weights = np.square(np.clip(coh, 0.0, 1.0))
+        if config.weighted_stacking and coherence is not None:
+            weights = np.square(np.clip(coherence, 0.0, 1.0))
         weights[~mask] = 0.0
         disp[~mask] = np.nan
 
         valid = np.isfinite(disp) & (weights > 0)
-        if config.weighted_stacking:
-            cum[valid] += disp[valid] * weights[valid]
-            weight_sum[valid] += weights[valid]
+        if config.robust_estimation:
+            disp_stack.append(disp.copy())
+            weight_stack.append(weights.copy())
         else:
-            cum[valid] += disp[valid]
-            weight_sum[valid] += 1.0
+            if config.weighted_stacking:
+                cum[valid] += disp[valid] * weights[valid]
+                weight_sum[valid] += weights[valid]
+            else:
+                cum[valid] += disp[valid]
+                weight_sum[valid] += 1.0
 
-    if config.weighted_stacking:
-        with np.errstate(invalid="ignore", divide="ignore"):
-            cum = np.where(weight_sum > 0, cum / weight_sum, np.nan)
+    if config.robust_estimation and disp_stack:
+        disp_cube = np.stack(disp_stack, axis=0)
+        weight_cube = np.stack(weight_stack, axis=0)
+        cum = robust_weighted_stack(
+            disp_cube, weight_cube, config.robust_mad_threshold
+        )
     else:
-        cum = np.where(weight_sum > 0, cum, np.nan)
+        if config.weighted_stacking:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                cum = np.where(weight_sum > 0, cum / weight_sum, np.nan)
+        else:
+            cum = np.where(weight_sum > 0, cum, np.nan)
 
     nodata = -9999.0
     if config.output_mm:
@@ -951,6 +1110,37 @@ def main() -> None:
         default=DEFAULT_REQUIRED_DISK_GB,
         help="磁盘预检所需最小剩余空间（GB）",
     )
+    parser.add_argument(
+        "--loop-closure-threshold-mm",
+        type=float,
+        default=DEFAULT_LOOP_CLOSURE_THRESHOLD_MM,
+        help="闭合差阈值（毫米）",
+    )
+    parser.add_argument(
+        "--atm-filter-block-size",
+        type=int,
+        default=DEFAULT_ATM_FILTER_BLOCK_SIZE,
+        help="大气滤波空间块大小（像素）",
+    )
+    parser.add_argument(
+        "--jump-gradient-threshold",
+        type=float,
+        default=DEFAULT_JUMP_GRADIENT_THRESHOLD,
+        help="解缠跳变梯度阈值（位移幅度）",
+    )
+    parser.add_argument(
+        "--no-robust-estimation",
+        action="store_false",
+        dest="robust_estimation",
+        default=DEFAULT_ROBUST_ESTIMATION,
+        help="禁用稳健估计（MAD 剔除）",
+    )
+    parser.add_argument(
+        "--robust-mad-threshold",
+        type=float,
+        default=DEFAULT_ROBUST_MAD_THRESHOLD,
+        help="MAD 异常剔除倍数",
+    )
     args = parser.parse_args()
 
     output_base_dir = os.path.join(args.project_root, "Output")
@@ -981,6 +1171,11 @@ def main() -> None:
         output_mm=DEFAULT_OUTPUT_MM,
         required_disk_gb=args.required_disk_gb,
         max_temporal_baseline_days=args.max_temporal_baseline,
+        loop_closure_threshold_mm=args.loop_closure_threshold_mm,
+        atm_filter_block_size=args.atm_filter_block_size,
+        jump_gradient_threshold=args.jump_gradient_threshold,
+        robust_estimation=args.robust_estimation,
+        robust_mad_threshold=args.robust_mad_threshold,
     )
 
     setup_logging(os.path.join(config.output_dir, "logs"), args.run_id)
@@ -1031,6 +1226,9 @@ def main() -> None:
             LOGGER.warning("未生成任何配对，请检查 max_temporal_baseline 设置")
             continue
         tif_pairs: List[Tuple[str, Optional[str]]] = []
+        tif_pairs_with_dates: List[
+            Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]
+        ] = []
 
         LOGGER.info("🚀 [Phase 2] 干涉计算并行（max_workers=%s）...", config.max_cpu_tasks)
         with ProcessPoolExecutor(max_workers=config.max_cpu_tasks) as ex:
@@ -1042,13 +1240,24 @@ def main() -> None:
 
             for f in as_completed(futs):
                 try:
-                    disp_tif, coh_tif = f.result()
-                    tif_pairs.append((disp_tif, coh_tif))
+                    m_date, s_date, disp_tif, coh_tif = f.result()
+                    tif_pairs_with_dates.append((m_date, s_date, disp_tif, coh_tif))
                     LOGGER.info("✅ 完成: %s", os.path.basename(disp_tif))
                 except Exception as e:
                     LOGGER.exception("❌ pair 失败: %s", e)
 
-        tif_pairs = sorted(tif_pairs, key=lambda x: x[0])
+        filtered_pairs = filter_pairs_by_loop_closure(
+            tif_pairs_with_dates, config.loop_closure_threshold_mm
+        )
+        if len(filtered_pairs) < len(tif_pairs_with_dates):
+            LOGGER.warning(
+                "闭合差剔除 %s/%s 个干涉对",
+                len(tif_pairs_with_dates) - len(filtered_pairs),
+                len(tif_pairs_with_dates),
+            )
+        tif_pairs = sorted(
+            [(disp, coh) for _, _, disp, coh in filtered_pairs], key=lambda x: x[0]
+        )
         swath_out, stats = calc_cumulative(
             config, tif_pairs, f"Total_Subsidence_{swath}.tif"
         )

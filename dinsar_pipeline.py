@@ -8,8 +8,8 @@ import shutil
 import logging
 import argparse
 import json
-import uuid
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 
 import geopandas as gpd
 from shapely.geometry import Point
@@ -23,33 +23,55 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from typing import Optional, List, Tuple, Dict, Any
 
+@dataclass(frozen=True)
+class PipelineConfig:
+    input_dir: str
+    shp_path: str
+    project_root: str
+    output_base_dir: str
+    output_dir: str
+    temp_dir: str
+    gpt_path: str
+    snaphu_cmd: str
+    max_cpu_tasks: int
+    threads_per_worker: int
+    jvm_heap: str
+    tile_cache: str
+    incidence_angle: float
+    coherence_threshold: float
+    weighted_stacking: bool
+    orbital_ramp_removal: bool
+    topo_phase_correction: bool
+    dem_tif_path: str
+    dem_name: str
+    use_esd: bool
+    output_mm: bool
+
+
 # ================= 服务器配置（按你给的） =================
-INPUT_DIR = r"D:\leixiang\D-InSAR\S1_Data"
-SHP_PATH = r"D:\leixiang\D-InSAR\GreatWall_Buffer\Hebei_Baoding_1km.shp"
-PROJECT_ROOT = r"D:\leixiang\D-InSAR"
-OUTPUT_BASE_DIR = os.path.join(PROJECT_ROOT, "Output")
-OUTPUT_DIR = OUTPUT_BASE_DIR
-TEMP_DIR = os.path.join(OUTPUT_DIR, "Temp_Preprocessed")
+DEFAULT_INPUT_DIR = r"D:\leixiang\D-InSAR\S1_Data"
+DEFAULT_SHP_PATH = r"D:\leixiang\D-InSAR\GreatWall_Buffer\Hebei_Baoding_1km.shp"
+DEFAULT_PROJECT_ROOT = r"D:\leixiang\D-InSAR"
 
-GPT_PATH = r"C:\Program Files\esa-snap\bin\gpt.exe"
-SNAPHU_CMD = r"D:\leixiang\D-InSAR\Software\snaphu-v1.4.2_win64\bin\snaphu.exe"
+DEFAULT_GPT_PATH = r"C:\Program Files\esa-snap\bin\gpt.exe"
+DEFAULT_SNAPHU_CMD = r"D:\leixiang\D-InSAR\Software\snaphu-v1.4.2_win64\bin\snaphu.exe"
 
-MAX_CPU_TASKS = 2  # 并行 gpt/snaphu 的进程数（先跑通可改 1）
-THREADS_PER_WORKER = 40  # 每个 GPT 进程线程
-JVM_HEAP = "32G"  # 每个 GPT 进程堆
-TILE_CACHE = "12G"
+DEFAULT_MAX_CPU_TASKS = 2  # 并行 gpt/snaphu 的进程数（先跑通可改 1）
+DEFAULT_THREADS_PER_WORKER = 40  # 每个 GPT 进程线程
+DEFAULT_JVM_HEAP = "32G"  # 每个 GPT 进程堆
+DEFAULT_TILE_CACHE = "12G"
 
-INCIDENCE_ANGLE = 39.5
-COHERENCE_THRESHOLD = 0.30
-WEIGHTED_STACKING = True  # 相干性加权堆栈
-ORBITAL_RAMP_REMOVAL = True  # 轨道误差精炼（移除平面相位坡度）
-TOPO_PHASE_CORRECTION = True  # 大气延迟线性修正（与高程线性相关）
-DEM_TIF_PATH = r"D:\leixiang\D-InSAR\DEM\dem.tif"
+DEFAULT_INCIDENCE_ANGLE = 39.5
+DEFAULT_COHERENCE_THRESHOLD = 0.30
+DEFAULT_WEIGHTED_STACKING = True  # 相干性加权堆栈
+DEFAULT_ORBITAL_RAMP_REMOVAL = True  # 轨道误差精炼（移除平面相位坡度）
+DEFAULT_TOPO_PHASE_CORRECTION = True  # 大气延迟线性修正（与高程线性相关）
+DEFAULT_DEM_TIF_PATH = r"D:\leixiang\D-InSAR\DEM\dem.tif"
 
 # 精度向选项
-DEM_NAME = "SRTM 1Sec HGT"  # 想和本地一致就改回 "SRTM 3Sec"
-USE_ESD = True  # TOPS 配准增强
-OUTPUT_MM = True  # 输出毫米（PhaseToDisplacement 通常是米）
+DEFAULT_DEM_NAME = "SRTM 1Sec HGT"  # 想和本地一致就改回 "SRTM 3Sec"
+DEFAULT_USE_ESD = True  # TOPS 配准增强
+DEFAULT_OUTPUT_MM = True  # 输出毫米（PhaseToDisplacement 通常是米）
 # =========================================================
 
 
@@ -268,16 +290,16 @@ XML_GEO_COH = r"""<graph id="Graph"><version>1.0</version>
 </graph>"""
 
 
-def validate_environment() -> None:
+def validate_environment(config: PipelineConfig) -> None:
     missing = []
-    for path in [INPUT_DIR, SHP_PATH, GPT_PATH, SNAPHU_CMD]:
+    for path in [config.input_dir, config.shp_path, config.gpt_path, config.snaphu_cmd]:
         if not os.path.exists(path):
             missing.append(path)
     if missing:
         missing_str = "\n".join(f"- {p}" for p in missing)
         raise FileNotFoundError(f"缺少必要路径/可执行文件:\n{missing_str}")
-    if TOPO_PHASE_CORRECTION and not os.path.exists(DEM_TIF_PATH):
-        LOGGER.warning("未找到 DEM_TIF_PATH: %s，将跳过线性高程修正", DEM_TIF_PATH)
+    if config.topo_phase_correction and not os.path.exists(config.dem_tif_path):
+        LOGGER.warning("未找到 DEM_TIF_PATH: %s，将跳过线性高程修正", config.dem_tif_path)
 
 
 def create_xml_file(template: str, replace_dict: Dict[str, str], out_path: str) -> None:
@@ -288,17 +310,28 @@ def create_xml_file(template: str, replace_dict: Dict[str, str], out_path: str) 
         f.write(content)
 
 
-def run_gpt(xml_path: str, task_id: str, work_dir: Optional[str] = None) -> None:
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    local_tmp = os.path.join(TEMP_DIR, f"java_tmp_{task_id}")
+def run_gpt(
+    config: PipelineConfig, xml_path: str, task_id: str, work_dir: Optional[str] = None
+) -> None:
+    os.makedirs(config.temp_dir, exist_ok=True)
+    local_tmp = os.path.join(config.temp_dir, f"java_tmp_{task_id}")
     os.makedirs(local_tmp, exist_ok=True)
 
     java_tmp = local_tmp.replace("\\", "/")
     env = os.environ.copy()
-    env["JAVA_TOOL_OPTIONS"] = f"-Xmx{JVM_HEAP} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
+    env["JAVA_TOOL_OPTIONS"] = (
+        f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
+    )
 
-    log_path = os.path.join(TEMP_DIR, f"gpt_{task_id}.log")
-    cmd = [GPT_PATH, xml_path, "-q", str(THREADS_PER_WORKER), "-c", TILE_CACHE]
+    log_path = os.path.join(config.temp_dir, f"gpt_{task_id}.log")
+    cmd = [
+        config.gpt_path,
+        xml_path,
+        "-q",
+        str(config.threads_per_worker),
+        "-c",
+        config.tile_cache,
+    ]
 
     with open(log_path, "w", encoding="utf-8") as log:
         p = subprocess.run(
@@ -345,8 +378,10 @@ def compute_stats(arr: np.ndarray) -> Dict[str, float]:
     }
 
 
-def remove_planar_ramp(disp: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    if not ORBITAL_RAMP_REMOVAL:
+def remove_planar_ramp(
+    disp: np.ndarray, mask: np.ndarray, enabled: bool
+) -> np.ndarray:
+    if not enabled:
         return disp
     rows, cols = np.indices(disp.shape)
     valid = mask & np.isfinite(disp)
@@ -363,9 +398,9 @@ def remove_planar_ramp(disp: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 def linear_topo_phase_correction(
-    disp: np.ndarray, dem: np.ndarray, mask: np.ndarray
+    disp: np.ndarray, dem: np.ndarray, mask: np.ndarray, enabled: bool
 ) -> np.ndarray:
-    if not TOPO_PHASE_CORRECTION:
+    if not enabled:
         return disp
     valid = mask & np.isfinite(disp) & np.isfinite(dem)
     if valid.sum() < 10:
@@ -458,14 +493,16 @@ def analyze_all_subswaths(zip_path: str, shp_path: str):
     return tasks, wkt
 
 
-def preprocess_one(zip_file: str, subswath: str, s_burst: int, e_burst: int) -> str:
-    os.makedirs(TEMP_DIR, exist_ok=True)
+def preprocess_one(
+    config: PipelineConfig, zip_file: str, subswath: str, s_burst: int, e_burst: int
+) -> str:
+    os.makedirs(config.temp_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(zip_file))[0]
-    out_dim = os.path.join(TEMP_DIR, f"{base}_{subswath}_Split_Orb.dim")
+    out_dim = os.path.join(config.temp_dir, f"{base}_{subswath}_Split_Orb.dim")
     if os.path.exists(out_dim) and os.path.exists(out_dim.replace(".dim", ".data")):
         return out_dim
 
-    xml_path = os.path.join(TEMP_DIR, f"run_prep_{base}_{subswath}.xml")
+    xml_path = os.path.join(config.temp_dir, f"run_prep_{base}_{subswath}.xml")
     create_xml_file(
         XML_PREPROCESS,
         {
@@ -478,7 +515,7 @@ def preprocess_one(zip_file: str, subswath: str, s_burst: int, e_burst: int) -> 
         xml_path,
     )
 
-    run_gpt(xml_path, f"prep_{base}_{subswath}")
+    run_gpt(config, xml_path, f"prep_{base}_{subswath}")
     return out_dim
 
 
@@ -527,6 +564,7 @@ def fix_snaphu_conf(conf: str, work_dir: str) -> None:
 
 
 def run_pair(
+    config: PipelineConfig,
     swath: str,
     m_date: datetime.datetime,
     s_date: datetime.datetime,
@@ -535,7 +573,7 @@ def run_pair(
     wkt: str,
 ) -> Tuple[str, Optional[str]]:
     pair_name = f"{swath}_{m_date.strftime('%Y%m%d')}_{s_date.strftime('%Y%m%d')}"
-    pair_dir = os.path.join(OUTPUT_DIR, pair_name)
+    pair_dir = os.path.join(config.output_dir, pair_name)
     os.makedirs(pair_dir, exist_ok=True)
     status_path = os.path.join(pair_dir, "status.json")
     status = load_status(status_path)
@@ -545,7 +583,7 @@ def run_pair(
     if not os.path.exists(core_dim) or not status.get("core_ifg"):
         esd_node = ""
         pre_ifg = "Back-Geocoding"
-        if USE_ESD:
+        if config.use_esd:
             esd_node = r"""
   <node id="ESD"><operator>Enhanced-Spectral-Diversity</operator>
     <sources><sourceProduct refid="Back-Geocoding"/></sources>
@@ -562,12 +600,12 @@ def run_pair(
             {
                 "master": m_dim,
                 "slave": s_dim,
-                "demName": DEM_NAME,
+                "demName": config.dem_name,
                 "output": core_dim,
             },
             xml_path,
         )
-        run_gpt(xml_path, f"core_{pair_name}", work_dir=pair_dir)
+        run_gpt(config, xml_path, f"core_{pair_name}", work_dir=pair_dir)
         status["core_ifg"] = True
         save_status(status_path, status)
 
@@ -582,14 +620,14 @@ def run_pair(
             XML_STEP2_FILTER,
             {
                 "input": core_dim,
-                "demName": DEM_NAME,
+                "demName": config.dem_name,
                 "wkt": wkt,
                 "targetFolder": pair_dir,
                 "output": subset_dim,
             },
             xml_path,
         )
-        run_gpt(xml_path, f"filter_{pair_name}", work_dir=pair_dir)
+        run_gpt(config, xml_path, f"filter_{pair_name}", work_dir=pair_dir)
         status["subset_ifg"] = True
         save_status(status_path, status)
 
@@ -616,7 +654,7 @@ def run_pair(
             raise RuntimeError("无法从 .hdr 读取 width(samples=)")
 
         subprocess.check_call(
-            [SNAPHU_CMD, "-f", "snaphu.conf", phase_name, width, "-o", unw_name],
+            [config.snaphu_cmd, "-f", "snaphu.conf", phase_name, width, "-o", unw_name],
             cwd=snaphu_dir,
         )
 
@@ -629,7 +667,7 @@ def run_pair(
         save_status(status_path, status)
 
     # Step4：Export displacement & coherence
-    disp_tif = os.path.join(OUTPUT_DIR, f"Result_{pair_name}_disp.tif")
+    disp_tif = os.path.join(config.output_dir, f"Result_{pair_name}_disp.tif")
     if not os.path.exists(disp_tif) or not status.get("disp_export"):
         xml_path = os.path.join(pair_dir, "run_export_disp.xml")
         create_xml_file(
@@ -637,33 +675,33 @@ def run_pair(
             {
                 "wrapped": subset_dim,
                 "unwrapped": out_unw.replace(".img", ".hdr"),
-                "demName": DEM_NAME,
+                "demName": config.dem_name,
                 "outFile": disp_tif,
             },
             xml_path,
         )
-        run_gpt(xml_path, f"disp_{pair_name}", work_dir=pair_dir)
+        run_gpt(config, xml_path, f"disp_{pair_name}", work_dir=pair_dir)
         status["disp_export"] = True
         save_status(status_path, status)
 
     # coherence band（失败则降级不掩膜）
     pair_date_str = f"{m_date.strftime('%d%b%Y')}_{s_date.strftime('%d%b%Y')}"
     coh_band = f"coh_{swath}_VV_{pair_date_str}"
-    coh_tif = os.path.join(OUTPUT_DIR, f"Result_{pair_name}_coh.tif")
+    coh_tif = os.path.join(config.output_dir, f"Result_{pair_name}_coh.tif")
     if not os.path.exists(coh_tif) or not status.get("coh_export"):
         xml_path = os.path.join(pair_dir, "run_export_coh.xml")
         create_xml_file(
             XML_GEO_COH,
             {
                 "input": subset_dim,
-                "demName": DEM_NAME,
+                "demName": config.dem_name,
                 "cohBand": coh_band,
                 "outFile": coh_tif,
             },
             xml_path,
         )
         try:
-            run_gpt(xml_path, f"coh_{pair_name}", work_dir=pair_dir)
+            run_gpt(config, xml_path, f"coh_{pair_name}", work_dir=pair_dir)
             status["coh_export"] = True
             save_status(status_path, status)
         except Exception:
@@ -673,7 +711,7 @@ def run_pair(
 
 
 def calc_cumulative(
-    tif_pairs: List[Tuple[str, Optional[str]]], out_name: str
+    config: PipelineConfig, tif_pairs: List[Tuple[str, Optional[str]]], out_name: str
 ) -> Tuple[Optional[str], Dict[str, float]]:
     if not tif_pairs:
         return None, {}
@@ -688,8 +726,8 @@ def calc_cumulative(
     weight_sum = np.zeros((h, w), dtype=np.float32)
 
     dem = None
-    if TOPO_PHASE_CORRECTION and os.path.exists(DEM_TIF_PATH):
-        with rasterio.open(DEM_TIF_PATH) as dem_src:
+    if config.topo_phase_correction and os.path.exists(config.dem_tif_path):
+        with rasterio.open(config.dem_tif_path) as dem_src:
             dem = np.full((h, w), np.nan, dtype=np.float32)
             reproject(
                 source=rasterio.band(dem_src, 1),
@@ -700,7 +738,7 @@ def calc_cumulative(
                 dst_crs=ref_crs,
                 resampling=Resampling.bilinear,
             )
-    elif TOPO_PHASE_CORRECTION:
+    elif config.topo_phase_correction:
         LOGGER.warning("未找到 DEM_TIF_PATH，跳过线性高程修正")
 
     for disp_path, coh_path in tif_pairs:
@@ -729,50 +767,54 @@ def calc_cumulative(
                     dst_crs=ref_crs,
                     resampling=Resampling.bilinear,
                 )
-            mask = coh >= COHERENCE_THRESHOLD
+            mask = coh >= config.coherence_threshold
 
         if dem is not None:
-            disp = linear_topo_phase_correction(disp, dem, mask)
+            disp = linear_topo_phase_correction(
+                disp, dem, mask, config.topo_phase_correction
+            )
 
-        disp = remove_planar_ramp(disp, mask)
+        disp = remove_planar_ramp(disp, mask, config.orbital_ramp_removal)
 
         weights = np.ones((h, w), dtype=np.float32)
-        if WEIGHTED_STACKING and coh_path and os.path.exists(coh_path):
+        if config.weighted_stacking and coh_path and os.path.exists(coh_path):
             weights = coh
         weights[~mask] = 0.0
         disp[~mask] = np.nan
 
         valid = np.isfinite(disp) & (weights > 0)
-        if WEIGHTED_STACKING:
+        if config.weighted_stacking:
             cum[valid] += disp[valid] * weights[valid]
             weight_sum[valid] += weights[valid]
         else:
             cum[valid] += disp[valid]
             weight_sum[valid] += 1.0
 
-    if WEIGHTED_STACKING:
+    if config.weighted_stacking:
         with np.errstate(invalid="ignore", divide="ignore"):
             cum = np.where(weight_sum > 0, cum / weight_sum, np.nan)
     else:
         cum = np.where(weight_sum > 0, cum, np.nan)
 
-    vert = cum / np.cos(np.deg2rad(INCIDENCE_ANGLE))
+    vert = cum / np.cos(np.deg2rad(config.incidence_angle))
 
     nodata = -9999.0
-    if OUTPUT_MM:
+    if config.output_mm:
         vert = vert * 1000.0
         out_name = out_name.replace(".tif", "_mm.tif")
 
     out = np.where(np.isnan(vert), nodata, vert).astype(np.float32)
 
     ref_meta.update(dtype=rasterio.float32, count=1, nodata=nodata, compress="deflate")
-    out_path = os.path.join(OUTPUT_DIR, out_name)
+    out_path = os.path.join(config.output_dir, out_name)
     with rasterio.open(out_path, "w", **ref_meta) as dst:
         dst.write(out, 1)
     return out_path, compute_stats(vert)
 
 
-def mosaic_results(tif_paths: List[str], out_name: str) -> Tuple[Optional[str], Dict[str, float]]:
+def mosaic_results(
+    config: PipelineConfig, tif_paths: List[str], out_name: str
+) -> Tuple[Optional[str], Dict[str, float]]:
     if not tif_paths:
         return None, {}
     srcs = [rasterio.open(p) for p in tif_paths]
@@ -787,7 +829,7 @@ def mosaic_results(tif_paths: List[str], out_name: str) -> Tuple[Optional[str], 
             "compress": "deflate",
         }
     )
-    out_path = os.path.join(OUTPUT_DIR, out_name)
+    out_path = os.path.join(config.output_dir, out_name)
     with rasterio.open(out_path, "w", **out_meta) as dst:
         dst.write(mosaic)
     for s in srcs:
@@ -798,37 +840,49 @@ def mosaic_results(tif_paths: List[str], out_name: str) -> Tuple[Optional[str], 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="D-InSAR pipeline")
-    parser.add_argument("--input-dir", default=INPUT_DIR)
-    parser.add_argument("--shp-path", default=SHP_PATH)
-    parser.add_argument("--project-root", default=PROJECT_ROOT)
-    parser.add_argument("--gpt-path", default=GPT_PATH)
-    parser.add_argument("--snaphu-cmd", default=SNAPHU_CMD)
-    parser.add_argument("--dem-tif-path", default=DEM_TIF_PATH)
+    parser.add_argument("--input-dir", default=DEFAULT_INPUT_DIR)
+    parser.add_argument("--shp-path", default=DEFAULT_SHP_PATH)
+    parser.add_argument("--project-root", default=DEFAULT_PROJECT_ROOT)
+    parser.add_argument("--gpt-path", default=DEFAULT_GPT_PATH)
+    parser.add_argument("--snaphu-cmd", default=DEFAULT_SNAPHU_CMD)
+    parser.add_argument("--dem-tif-path", default=DEFAULT_DEM_TIF_PATH)
     parser.add_argument("--run-id", default=datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-    parser.add_argument("--max-workers", type=int, default=MAX_CPU_TASKS)
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_CPU_TASKS)
     args = parser.parse_args()
 
-    global INPUT_DIR, SHP_PATH, PROJECT_ROOT, OUTPUT_BASE_DIR, OUTPUT_DIR, TEMP_DIR
-    global GPT_PATH, SNAPHU_CMD, DEM_TIF_PATH, MAX_CPU_TASKS
+    output_base_dir = os.path.join(args.project_root, "Output")
+    output_dir = os.path.join(output_base_dir, args.run_id)
+    temp_dir = os.path.join(output_dir, "Temp_Preprocessed")
+    config = PipelineConfig(
+        input_dir=args.input_dir,
+        shp_path=args.shp_path,
+        project_root=args.project_root,
+        output_base_dir=output_base_dir,
+        output_dir=output_dir,
+        temp_dir=temp_dir,
+        gpt_path=args.gpt_path,
+        snaphu_cmd=args.snaphu_cmd,
+        max_cpu_tasks=args.max_workers,
+        threads_per_worker=DEFAULT_THREADS_PER_WORKER,
+        jvm_heap=DEFAULT_JVM_HEAP,
+        tile_cache=DEFAULT_TILE_CACHE,
+        incidence_angle=DEFAULT_INCIDENCE_ANGLE,
+        coherence_threshold=DEFAULT_COHERENCE_THRESHOLD,
+        weighted_stacking=DEFAULT_WEIGHTED_STACKING,
+        orbital_ramp_removal=DEFAULT_ORBITAL_RAMP_REMOVAL,
+        topo_phase_correction=DEFAULT_TOPO_PHASE_CORRECTION,
+        dem_tif_path=args.dem_tif_path,
+        dem_name=DEFAULT_DEM_NAME,
+        use_esd=DEFAULT_USE_ESD,
+        output_mm=DEFAULT_OUTPUT_MM,
+    )
 
-    INPUT_DIR = args.input_dir
-    SHP_PATH = args.shp_path
-    PROJECT_ROOT = args.project_root
-    GPT_PATH = args.gpt_path
-    SNAPHU_CMD = args.snaphu_cmd
-    DEM_TIF_PATH = args.dem_tif_path
-    MAX_CPU_TASKS = args.max_workers
+    setup_logging(os.path.join(config.output_dir, "logs"), args.run_id)
+    validate_environment(config)
+    os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(config.temp_dir, exist_ok=True)
 
-    OUTPUT_BASE_DIR = os.path.join(PROJECT_ROOT, "Output")
-    OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, args.run_id)
-    TEMP_DIR = os.path.join(OUTPUT_DIR, "Temp_Preprocessed")
-
-    setup_logging(os.path.join(OUTPUT_DIR, "logs"), args.run_id)
-    validate_environment()
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(TEMP_DIR, exist_ok=True)
-
-    zips = sorted(glob.glob(os.path.join(INPUT_DIR, "*.zip")))
+    zips = sorted(glob.glob(os.path.join(config.input_dir, "*.zip")))
     dated_files = []
     for z in zips:
         date = get_date_from_zip(z)
@@ -840,7 +894,7 @@ def main() -> None:
         return
 
     LOGGER.info("🔍 [Phase 0] 分析覆盖条带 & Burst...")
-    tasks, wkt = analyze_all_subswaths(file_map[0][1], SHP_PATH)
+    tasks, wkt = analyze_all_subswaths(file_map[0][1], config.shp_path)
     if not tasks:
         LOGGER.error("SHP 与影像无交集或元数据读取失败")
         return
@@ -862,16 +916,18 @@ def main() -> None:
                 s_burst,
                 e_burst,
             )
-            pre_map[d] = preprocess_one(z, swath, s_burst, e_burst)
+            pre_map[d] = preprocess_one(config, z, swath, s_burst, e_burst)
 
         pairs = [(file_map[i][0], file_map[i + 1][0]) for i in range(len(file_map) - 1)]
         tif_pairs: List[Tuple[str, Optional[str]]] = []
 
-        LOGGER.info("🚀 [Phase 2] 干涉计算并行（max_workers=%s）...", MAX_CPU_TASKS)
-        with ProcessPoolExecutor(max_workers=MAX_CPU_TASKS) as ex:
+        LOGGER.info("🚀 [Phase 2] 干涉计算并行（max_workers=%s）...", config.max_cpu_tasks)
+        with ProcessPoolExecutor(max_workers=config.max_cpu_tasks) as ex:
             futs = []
             for m, s in pairs:
-                futs.append(ex.submit(run_pair, swath, m, s, pre_map[m], pre_map[s], wkt))
+                futs.append(
+                    ex.submit(run_pair, config, swath, m, s, pre_map[m], pre_map[s], wkt)
+                )
 
             for f in as_completed(futs):
                 try:
@@ -882,14 +938,16 @@ def main() -> None:
                     LOGGER.exception("❌ pair 失败: %s", e)
 
         tif_pairs = sorted(tif_pairs, key=lambda x: x[0])
-        swath_out, stats = calc_cumulative(tif_pairs, f"Total_Subsidence_{swath}.tif")
+        swath_out, stats = calc_cumulative(
+            config, tif_pairs, f"Total_Subsidence_{swath}.tif"
+        )
         if swath_out:
             LOGGER.info("🎉 条带累计完成: %s", swath_out)
             swath_final_tifs.append(swath_out)
             quality_report["swaths"][swath] = {"path": swath_out, "stats": stats}
 
     final, final_stats = mosaic_results(
-        swath_final_tifs, "Final_Combined_Subsidence_Vertical_Masked.tif"
+        config, swath_final_tifs, "Final_Combined_Subsidence_Vertical_Masked.tif"
     )
     if final:
         LOGGER.info("🏆 最终拼接完成: %s", final)
@@ -897,7 +955,7 @@ def main() -> None:
     else:
         LOGGER.warning("未生成最终结果")
 
-    report_path = os.path.join(OUTPUT_DIR, "quality_report.json")
+    report_path = os.path.join(config.output_dir, "quality_report.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(quality_report, f, ensure_ascii=False, indent=2)
 

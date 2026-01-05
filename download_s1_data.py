@@ -97,6 +97,18 @@ def format_size(num_bytes: float) -> str:
     return f"{gb:.2f} GB"
 
 
+def validate_zip(path: str, filename: str) -> None:
+    try:
+        with zipfile.ZipFile(path) as zip_file:
+            bad_member = zip_file.testzip()
+            if bad_member:
+                raise zipfile.BadZipFile(f"坏文件成员: {bad_member}")
+    except zipfile.BadZipFile as exc:
+        logging.warning("ZIP 校验失败，删除并标记失败: %s (%s)", filename, exc)
+        os.remove(path)
+        raise
+
+
 def download_file(url: str, session: requests.Session, config: DownloadConfig) -> None:
     filename = url.split("/")[-1]
     save_path = os.path.join(config.save_dir, filename)
@@ -107,73 +119,86 @@ def download_file(url: str, session: requests.Session, config: DownloadConfig) -
         logging.info("已存在，跳过: %s", filename)
         return
 
-    existing_path = temp_path if os.path.exists(temp_path) else save_path
-    existing_size = os.path.getsize(existing_path) if os.path.exists(existing_path) else 0
-    if 0 < existing_size < min_valid_size and existing_path == save_path:
-        logging.warning("发现疑似损坏文件，删除重下: %s", save_path)
-        os.remove(save_path)
-        existing_size = 0
-        existing_path = temp_path
+    for attempt in range(1, config.max_retries + 2):
+        try:
+            existing_path = temp_path if os.path.exists(temp_path) else save_path
+            existing_size = (
+                os.path.getsize(existing_path) if os.path.exists(existing_path) else 0
+            )
+            if 0 < existing_size < min_valid_size and existing_path == save_path:
+                logging.warning("发现疑似损坏文件，删除重下: %s", save_path)
+                os.remove(save_path)
+                existing_size = 0
+                existing_path = temp_path
 
-    headers = {}
-    if existing_size > 0:
-        headers["Range"] = f"bytes={existing_size}-"
-        logging.info("续传: %s (%s)", filename, format_size(existing_size))
-    else:
-        logging.info("下载: %s", filename)
+            headers = {}
+            if existing_size > 0:
+                headers["Range"] = f"bytes={existing_size}-"
+                logging.info("续传: %s (%s)", filename, format_size(existing_size))
+            else:
+                logging.info("下载: %s", filename)
 
-    with session.get(url, stream=True, timeout=config.timeout_s, headers=headers) as resp:
-        if resp.status_code == 401 or "login" in resp.url:
-            logging.info("进行 Earthdata 认证重定向: %s", filename)
-            resp = session.get(resp.url, stream=True, timeout=config.timeout_s)
-        resp.raise_for_status()
+            with session.get(
+                url, stream=True, timeout=config.timeout_s, headers=headers
+            ) as resp:
+                if resp.status_code == 401 or "login" in resp.url:
+                    logging.info("进行 Earthdata 认证重定向: %s", filename)
+                    resp = session.get(resp.url, stream=True, timeout=config.timeout_s)
+                resp.raise_for_status()
 
-        if existing_size > 0 and resp.status_code != 206:
-            logging.warning("服务器不支持续传，重新下载: %s", filename)
-            existing_size = 0
-            existing_path = temp_path
+                if existing_size > 0 and resp.status_code != 206:
+                    logging.warning("服务器不支持续传，重新下载: %s", filename)
+                    existing_size = 0
+                    existing_path = temp_path
 
-        mode = "ab" if resp.status_code == 206 else "wb"
-        total_size = int(resp.headers.get("content-length", 0)) + existing_size
-        chunk_size = config.chunk_size_mb * 1024 * 1024
+                mode = "ab" if resp.status_code == 206 else "wb"
+                total_size = int(resp.headers.get("content-length", 0)) + existing_size
+                chunk_size = config.chunk_size_mb * 1024 * 1024
 
-        downloaded = existing_size
-        start_time = time.time()
-        last_log_time = start_time
-        with open(existing_path, mode) as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                downloaded += len(chunk)
+                downloaded = existing_size
+                start_time = time.time()
+                last_log_time = start_time
+                with open(existing_path, mode) as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
 
-                now = time.time()
-                if total_size > 0 and now - last_log_time >= 5:
-                    percent = downloaded / total_size * 100
-                    speed = downloaded / max(now - start_time, 1e-6) / 1024**2
-                    logging.info(
-                        "进度: %s %s/%s (%.1f%%, %.1f MB/s)",
-                        filename,
-                        format_size(downloaded),
-                        format_size(total_size),
-                        percent,
-                        speed,
-                    )
-                    last_log_time = now
+                        now = time.time()
+                        if total_size > 0 and now - last_log_time >= 5:
+                            percent = downloaded / total_size * 100
+                            speed = (
+                                downloaded / max(now - start_time, 1e-6) / 1024**2
+                            )
+                            logging.info(
+                                "进度: %s %s/%s (%.1f%%, %.1f MB/s)",
+                                filename,
+                                format_size(downloaded),
+                                format_size(total_size),
+                                percent,
+                                speed,
+                            )
+                            last_log_time = now
 
-    if os.path.exists(existing_path) and existing_path != save_path:
-        os.replace(existing_path, save_path)
-    try:
-        with zipfile.ZipFile(save_path) as zip_file:
-            bad_member = zip_file.testzip()
-            if bad_member:
-                raise zipfile.BadZipFile(f"坏文件成员: {bad_member}")
-    except zipfile.BadZipFile as exc:
-        logging.warning("ZIP 校验失败，删除并标记失败: %s (%s)", filename, exc)
-        os.remove(save_path)
-        raise
-
-    logging.info("完成: %s", filename)
+            if os.path.exists(existing_path) and existing_path != save_path:
+                os.replace(existing_path, save_path)
+            validate_zip(save_path, filename)
+            logging.info("完成: %s", filename)
+            return
+        except (requests.RequestException, zipfile.BadZipFile) as exc:
+            if attempt > config.max_retries:
+                logging.exception("下载失败: %s (%s)", url, exc)
+                raise
+            sleep_s = config.backoff_factor * (2 ** (attempt - 1))
+            logging.warning(
+                "下载异常，%ss 后重试(%s/%s): %s",
+                sleep_s,
+                attempt,
+                config.max_retries,
+                filename,
+            )
+            time.sleep(sleep_s)
 
 
 def download_all(urls: Iterable[str], config: DownloadConfig) -> None:

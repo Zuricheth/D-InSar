@@ -988,9 +988,9 @@ def calc_cumulative(
     config: PipelineConfig,
     tif_pairs: List[Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]],
     out_name: str,
-) -> Tuple[Optional[str], Dict[str, float]]:
+) -> Tuple[Optional[str], Optional[str], Dict[str, float], Dict[str, float]]:
     if not tif_pairs:
-        return None, {}
+        return None, None, {}, {}
 
     with rasterio.open(tif_pairs[0][2]) as src0:
         ref_meta = src0.meta.copy()
@@ -1113,6 +1113,7 @@ def calc_cumulative(
     times = times[1:]
 
     rate = np.full((h, w), np.nan, dtype=np.float32)
+    cumulative_disp = np.full((h, w), np.nan, dtype=np.float32)
     for row in range(h):
         for col in range(w):
             L = disp_cube[:, row, col]
@@ -1130,6 +1131,9 @@ def calc_cumulative(
             except np.linalg.LinAlgError:
                 continue
             displacements = x[:-1]
+            if displacements.size == 0:
+                continue
+            cumulative_disp[row, col] = displacements[-1]
             if displacements.size != times.size:
                 continue
             if config.robust_estimation:
@@ -1156,16 +1160,28 @@ def calc_cumulative(
 
     if config.output_mm:
         rate = rate * 1000.0
+        cumulative_disp = cumulative_disp * 1000.0
         out_name = out_name.replace(".tif", "_mm_per_year.tif")
 
     nodata = -9999.0
     out = np.where(np.isnan(rate), nodata, rate).astype(np.float32)
+    cum_out = np.where(np.isnan(cumulative_disp), nodata, cumulative_disp).astype(
+        np.float32
+    )
 
     ref_meta.update(dtype=rasterio.float32, count=1, nodata=nodata, compress="deflate")
     out_path = os.path.join(config.output_dir, out_name)
     with rasterio.open(out_path, "w", **ref_meta) as dst:
         dst.write(out, 1)
-    return out_path, compute_stats(rate)
+    cumulative_name = (
+        "Final_Combined_Cumulative_Subsidence_mm.tif"
+        if config.output_mm
+        else "Final_Combined_Cumulative_Subsidence.tif"
+    )
+    cumulative_path = os.path.join(config.output_dir, cumulative_name)
+    with rasterio.open(cumulative_path, "w", **ref_meta) as dst:
+        dst.write(cum_out, 1)
+    return out_path, cumulative_path, compute_stats(rate), compute_stats(cumulative_disp)
 
 
 def mosaic_results(
@@ -1369,13 +1385,18 @@ def main() -> None:
                 len(tif_pairs_with_dates) - len(filtered_pairs),
                 len(tif_pairs_with_dates),
             )
-        swath_out, stats = calc_cumulative(
+        swath_out, cumulative_out, stats, cumulative_stats = calc_cumulative(
             config, filtered_pairs, f"Total_Subsidence_{swath}.tif"
         )
         if swath_out:
             LOGGER.info("🎉 条带累计完成: %s", swath_out)
             swath_final_tifs.append(swath_out)
-            quality_report["swaths"][swath] = {"path": swath_out, "stats": stats}
+            quality_report["swaths"][swath] = {
+                "path": swath_out,
+                "stats": stats,
+                "cumulative_path": cumulative_out,
+                "cumulative_stats": cumulative_stats,
+            }
 
     final, final_stats = mosaic_results(
         config, swath_final_tifs, "Final_Combined_Subsidence_Vertical_Masked.tif"

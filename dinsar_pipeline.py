@@ -683,6 +683,16 @@ def analyze_all_subswaths(zip_path: str, shp_path: str):
     return tasks, wkt
 
 
+def validate_input_zip(zip_path: str) -> None:
+    try:
+        with zipfile.ZipFile(zip_path) as zip_file:
+            bad_member = zip_file.testzip()
+            if bad_member:
+                raise zipfile.BadZipFile(f"坏文件成员: {bad_member}")
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"ZIP 文件损坏: {zip_path} ({exc})") from exc
+
+
 def build_sbas_pairs(
     dated_files: List[Tuple[datetime.datetime, str]], max_baseline_days: int
 ) -> List[Tuple[datetime.datetime, datetime.datetime]]:
@@ -781,6 +791,7 @@ def preprocess_one(
     config: PipelineConfig, zip_file: str, subswath: str, s_burst: int, e_burst: int
 ) -> str:
     os.makedirs(config.temp_dir, exist_ok=True)
+    validate_input_zip(zip_file)
     base = os.path.splitext(os.path.basename(zip_file))[0]
     out_dim = os.path.join(config.temp_dir, f"{base}_{subswath}_Split_Orb.dim")
     if os.path.exists(out_dim) and os.path.exists(out_dim.replace(".dim", ".data")):

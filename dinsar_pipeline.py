@@ -1325,7 +1325,7 @@ def main() -> None:
         LOGGER.error("影像不足 2 景")
         return
 
-    LOGGER.info("🔍 [Phase 0] 分析覆盖条带 & Burst...")
+    LOGGER.info("[Phase 0] 分析覆盖条带 & Burst...")
     tasks, wkt = analyze_all_subswaths(file_map[0][1], config.shp_path)
     if not tasks:
         LOGGER.error("SHP 与影像无交集或元数据读取失败")
@@ -1337,12 +1337,12 @@ def main() -> None:
     for task in tasks:
         swath = task["swath"]
         s_burst, e_burst = task["s"], task["e"]
-        LOGGER.info("🌊 === 条带 %s Burst %s-%s ===", swath, s_burst, e_burst)
+        LOGGER.info("=== 条带 %s Burst %s-%s ===", swath, s_burst, e_burst)
 
         pre_map = {}
         for d, z in file_map:
             LOGGER.info(
-                "⚙️ 预处理: %s | %s | Burst %s-%s",
+                "预处理: %s | %s | Burst %s-%s",
                 d.strftime("%Y%m%d"),
                 swath,
                 s_burst,
@@ -1359,7 +1359,7 @@ def main() -> None:
             Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]
         ] = []
 
-        LOGGER.info("🚀 [Phase 2] 干涉计算并行（max_workers=%s）...", config.max_cpu_tasks)
+        LOGGER.info("[Phase 2] 干涉计算并行（max_workers=%s）...", config.max_cpu_tasks)
         with ProcessPoolExecutor(max_workers=config.max_cpu_tasks) as ex:
             futs = []
             for m, s in pairs:
@@ -1371,9 +1371,9 @@ def main() -> None:
                 try:
                     m_date, s_date, disp_tif, coh_tif = f.result()
                     tif_pairs_with_dates.append((m_date, s_date, disp_tif, coh_tif))
-                    LOGGER.info("✅ 完成: %s", os.path.basename(disp_tif))
+                    LOGGER.info("完成: %s", os.path.basename(disp_tif))
                 except Exception as e:
-                    LOGGER.exception("❌ pair 失败: %s", e)
+                    LOGGER.exception("pair 失败: %s", e)
 
         disp_cache = preload_disp_cache(tif_pairs_with_dates)
         filtered_pairs = filter_pairs_by_loop_closure(
@@ -1389,7 +1389,7 @@ def main() -> None:
             config, filtered_pairs, f"Total_Subsidence_{swath}.tif"
         )
         if swath_out:
-            LOGGER.info("🎉 条带累计完成: %s", swath_out)
+            LOGGER.info("条带累计完成: %s", swath_out)
             swath_final_tifs.append(swath_out)
             quality_report["swaths"][swath] = {
                 "path": swath_out,
@@ -1402,7 +1402,7 @@ def main() -> None:
         config, swath_final_tifs, "Final_Combined_Subsidence_Vertical_Masked.tif"
     )
     if final:
-        LOGGER.info("🏆 最终拼接完成: %s", final)
+        LOGGER.info("最终拼接完成: %s", final)
         quality_report["final"] = {"path": final, "stats": final_stats}
     else:
         LOGGER.warning("未生成最终结果")

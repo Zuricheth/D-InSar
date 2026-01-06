@@ -354,10 +354,14 @@ def run_gpt(
     os.makedirs(local_tmp, exist_ok=True)
 
     java_tmp = local_tmp.replace("\\", "/")
+    os.makedirs(os.path.dirname(local_tmp), exist_ok=True)
     env = os.environ.copy()
     env["JAVA_TOOL_OPTIONS"] = (
         f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
     )
+    env["TMPDIR"] = java_tmp
+    env["TMP"] = java_tmp
+    env["TEMP"] = java_tmp
     normalize_env_paths(env)
 
     log_path = os.path.join(config.temp_dir, f"gpt_{task_id}.log")

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from math import cos, radians
 
 import geopandas as gpd
+import psutil
 from shapely.geometry import Point
 
 import numpy as np
@@ -357,6 +358,7 @@ def run_gpt(
     env["JAVA_TOOL_OPTIONS"] = (
         f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
     )
+    normalize_env_paths(env)
 
     log_path = os.path.join(config.temp_dir, f"gpt_{task_id}.log")
     cmd = [
@@ -460,6 +462,26 @@ def normalize_tile_cache(jvm_heap: str, tile_cache: str) -> str:
         adjusted_gb = max(adjusted // (1024**3), 1)
         return f"{adjusted_gb}G"
     return tile_cache
+
+
+def bytes_to_gb(value: float) -> int:
+    return max(int(value // (1024**3)), 1)
+
+
+def compute_memory_settings(max_workers: int) -> Tuple[str, str, int]:
+    available_bytes = psutil.virtual_memory().available
+    per_task_bytes = max(available_bytes * 0.4, 4 * 1024**3)
+    dynamic_max = max(1, int(available_bytes // per_task_bytes))
+    adjusted_max_workers = min(max_workers, dynamic_max)
+    jvm_heap_gb = max(int(per_task_bytes // (1024**3)), 4)
+    tile_cache_gb = max(int(jvm_heap_gb * 0.6), 1)
+    return f"{jvm_heap_gb}G", f"{tile_cache_gb}G", adjusted_max_workers
+
+
+def normalize_env_paths(env: Dict[str, str]) -> None:
+    for key in ("PATH", "JBLAS_HOME", "JBLAS_PATH"):
+        if key in env and env[key]:
+            env[key] = env[key].replace("\\", "/")
 
 
 def read_incidence_angle(tif_path: str, fallback: float) -> float:
@@ -1310,7 +1332,10 @@ def main() -> None:
     output_base_dir = os.path.join(args.project_root, "Output")
     output_dir = os.path.join(output_base_dir, args.run_id)
     temp_dir = os.path.join(output_dir, "Temp_Preprocessed")
-    tile_cache = normalize_tile_cache(DEFAULT_JVM_HEAP, DEFAULT_TILE_CACHE)
+    jvm_heap, tile_cache, adjusted_max_workers = compute_memory_settings(
+        args.max_workers
+    )
+    tile_cache = normalize_tile_cache(jvm_heap, tile_cache)
     config = PipelineConfig(
         input_dir=args.input_dir,
         shp_path=args.shp_path,
@@ -1320,9 +1345,9 @@ def main() -> None:
         temp_dir=temp_dir,
         gpt_path=args.gpt_path,
         snaphu_cmd=args.snaphu_cmd,
-        max_cpu_tasks=args.max_workers,
+        max_cpu_tasks=adjusted_max_workers,
         threads_per_worker=DEFAULT_THREADS_PER_WORKER,
-        jvm_heap=DEFAULT_JVM_HEAP,
+        jvm_heap=jvm_heap,
         tile_cache=tile_cache,
         incidence_angle=DEFAULT_INCIDENCE_ANGLE,
         coherence_threshold=DEFAULT_COHERENCE_THRESHOLD,
@@ -1344,8 +1369,9 @@ def main() -> None:
     )
 
     setup_logging(os.path.join(config.output_dir, "logs"), args.run_id)
-    if tile_cache != DEFAULT_TILE_CACHE:
-        LOGGER.info("调整 TILE_CACHE: %s -> %s", DEFAULT_TILE_CACHE, tile_cache)
+    if adjusted_max_workers != args.max_workers:
+        LOGGER.info("调整 max_workers: %s -> %s", args.max_workers, adjusted_max_workers)
+    LOGGER.info("JVM_HEAP=%s TILE_CACHE=%s", jvm_heap, tile_cache)
     validate_environment(config)
     os.makedirs(config.output_dir, exist_ok=True)
     os.makedirs(config.temp_dir, exist_ok=True)

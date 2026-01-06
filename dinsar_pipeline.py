@@ -340,7 +340,12 @@ def create_xml_file(template: str, replace_dict: Dict[str, str], out_path: str) 
 
 
 def run_gpt(
-    config: PipelineConfig, xml_path: str, task_id: str, work_dir: Optional[str] = None
+    config: PipelineConfig,
+    xml_path: str,
+    task_id: str,
+    work_dir: Optional[str] = None,
+    max_retries: int = 1,
+    retry_sleep_s: int = 10,
 ) -> None:
     os.makedirs(config.temp_dir, exist_ok=True)
     local_tmp = os.path.join(config.temp_dir, f"java_tmp_{task_id}")
@@ -363,20 +368,39 @@ def run_gpt(
         "-x",
     ]
 
-    with open(log_path, "w", encoding="utf-8") as log:
-        p = subprocess.run(
-            cmd,
-            cwd=work_dir,
-            env=env,
-            stdout=log,
-            stderr=log,
-            check=False,
+    attempt = 0
+    while True:
+        attempt += 1
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(f"\n=== GPT attempt {attempt}/{max_retries + 1} ===\n")
+            p = subprocess.run(
+                cmd,
+                cwd=work_dir,
+                env=env,
+                stdout=log,
+                stderr=log,
+                check=False,
+            )
+
+        if p.returncode == 0:
+            break
+        if attempt > max_retries:
+            break
+        LOGGER.warning(
+            "GPT 失败(%s) attempt %s/%s，%ss 后重试",
+            task_id,
+            attempt,
+            max_retries + 1,
+            retry_sleep_s,
         )
+        time.sleep(retry_sleep_s)
 
     shutil.rmtree(local_tmp, ignore_errors=True)
 
     if p.returncode != 0:
-        raise RuntimeError(f"GPT 失败({task_id})，查看日志: {log_path}")
+        raise RuntimeError(
+            f"GPT 失败({task_id})，退出码 {p.returncode}，查看日志: {log_path}"
+        )
 
 
 def load_status(status_path: str) -> Dict[str, Any]:

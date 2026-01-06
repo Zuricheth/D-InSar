@@ -8,6 +8,7 @@ import shutil
 import logging
 import argparse
 import json
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from math import cos, radians

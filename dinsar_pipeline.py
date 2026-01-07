@@ -350,11 +350,12 @@ def run_gpt(
     retry_sleep_s: int = 10,
 ) -> None:
     os.makedirs(config.temp_dir, exist_ok=True)
-    local_tmp = os.path.join(config.temp_dir, f"java_tmp_{task_id}")
+    base_tmp = os.path.abspath(os.path.join(config.project_root, "vcp_tmp"))
+    local_tmp = os.path.abspath(os.path.join(base_tmp, task_id))
     os.makedirs(local_tmp, exist_ok=True)
+    time.sleep(0.2)
 
-    java_tmp = local_tmp.replace("\\", "/")
-    os.makedirs(os.path.dirname(local_tmp), exist_ok=True)
+    java_tmp = local_tmp.replace("\\", "/").rstrip("/")
     env = os.environ.copy()
     env["JAVA_TOOL_OPTIONS"] = (
         f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"

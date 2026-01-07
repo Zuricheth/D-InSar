@@ -825,6 +825,15 @@ def preprocess_one(
     base = os.path.splitext(os.path.basename(zip_file))[0]
     out_dim = os.path.join(cache_dir, f"{base}_{subswath}_Split_Orb.dim")
     if os.path.exists(out_dim) and os.path.exists(out_dim.replace(".dim", ".data")):
+        LOGGER.info("预处理缓存命中: %s", os.path.basename(out_dim))
+        return out_dim
+
+    legacy_dim = os.path.join(config.temp_dir, f"{base}_{subswath}_Split_Orb.dim")
+    legacy_data = legacy_dim.replace(".dim", ".data")
+    if os.path.exists(legacy_dim) and os.path.exists(legacy_data):
+        shutil.move(legacy_dim, out_dim)
+        shutil.move(legacy_data, out_dim.replace(".dim", ".data"))
+        LOGGER.info("迁移预处理缓存: %s", os.path.basename(out_dim))
         return out_dim
 
     xml_path = os.path.join(config.temp_dir, f"run_prep_{base}_{subswath}.xml")

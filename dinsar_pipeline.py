@@ -359,12 +359,16 @@ def run_gpt(
 
     java_tmp = os.path.abspath(local_tmp).replace("\\", "/").rstrip("/")
     env = os.environ.copy()
+    java_opts = f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
+    existing_opts = env.get("JAVA_TOOL_OPTIONS", "").strip()
     env["JAVA_TOOL_OPTIONS"] = (
-        f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
+        f"{existing_opts} {java_opts}".strip() if existing_opts else java_opts
     )
+    env["_JAVA_OPTIONS"] = env["JAVA_TOOL_OPTIONS"]
     env["TMPDIR"] = java_tmp
     env["TMP"] = java_tmp
     env["TEMP"] = java_tmp
+    env["JBLAS_HOME"] = java_tmp
     normalize_env_paths(env)
 
     log_path = os.path.join(config.temp_dir, f"gpt_{task_id}.log")

@@ -350,12 +350,14 @@ def run_gpt(
     retry_sleep_s: int = 10,
 ) -> None:
     os.makedirs(config.temp_dir, exist_ok=True)
-    base_tmp = os.path.abspath(os.path.join(config.project_root, "vcp_tmp"))
+    base_tmp = os.path.abspath(os.path.join(config.project_root, "gpt_tmp"))
     local_tmp = os.path.abspath(os.path.join(base_tmp, task_id))
     os.makedirs(local_tmp, exist_ok=True)
+    if not os.path.exists(local_tmp):
+        raise RuntimeError(f"无法创建临时目录: {local_tmp}")
     time.sleep(0.2)
 
-    java_tmp = local_tmp.replace("\\", "/").rstrip("/")
+    java_tmp = os.path.abspath(local_tmp).replace("\\", "/").rstrip("/")
     env = os.environ.copy()
     env["JAVA_TOOL_OPTIONS"] = (
         f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
@@ -817,10 +819,11 @@ def filter_pairs_by_loop_closure(
 def preprocess_one(
     config: PipelineConfig, zip_file: str, subswath: str, s_burst: int, e_burst: int
 ) -> str:
-    os.makedirs(config.temp_dir, exist_ok=True)
+    cache_dir = os.path.join(config.project_root, "Preprocessed_Cache")
+    os.makedirs(cache_dir, exist_ok=True)
     validate_input_zip(zip_file)
     base = os.path.splitext(os.path.basename(zip_file))[0]
-    out_dim = os.path.join(config.temp_dir, f"{base}_{subswath}_Split_Orb.dim")
+    out_dim = os.path.join(cache_dir, f"{base}_{subswath}_Split_Orb.dim")
     if os.path.exists(out_dim) and os.path.exists(out_dim.replace(".dim", ".data")):
         return out_dim
 

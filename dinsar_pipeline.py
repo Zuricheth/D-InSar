@@ -8,10 +8,13 @@ import shutil
 import logging
 import argparse
 import json
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from math import cos, radians
 
 import geopandas as gpd
+import psutil
 from shapely.geometry import Point
 
 import numpy as np
@@ -46,6 +49,14 @@ class PipelineConfig:
     dem_name: str
     use_esd: bool
     output_mm: bool
+    required_disk_gb: int
+    max_temporal_baseline_days: int
+    loop_closure_threshold_mm: float
+    atm_filter_block_size: int
+    jump_gradient_threshold: float
+    robust_estimation: bool
+    robust_mad_threshold: float
+    reference_coherence_percentile: float
 
 
 # ================= 服务器配置（按你给的） =================
@@ -60,6 +71,14 @@ DEFAULT_MAX_CPU_TASKS = 2  # 并行 gpt/snaphu 的进程数（先跑通可改 1�
 DEFAULT_THREADS_PER_WORKER = 40  # 每个 GPT 进程线程
 DEFAULT_JVM_HEAP = "32G"  # 每个 GPT 进程堆
 DEFAULT_TILE_CACHE = "12G"
+DEFAULT_REQUIRED_DISK_GB = 500
+DEFAULT_MAX_TEMPORAL_BASELINE_DAYS = 60
+DEFAULT_LOOP_CLOSURE_THRESHOLD_MM = 15.0
+DEFAULT_ATM_FILTER_BLOCK_SIZE = 32
+DEFAULT_JUMP_GRADIENT_THRESHOLD = 0.08
+DEFAULT_ROBUST_ESTIMATION = True
+DEFAULT_ROBUST_MAD_THRESHOLD = 3.0
+DEFAULT_REFERENCE_COHERENCE_PERCENTILE = 95.0
 
 DEFAULT_INCIDENCE_ANGLE = 39.5
 DEFAULT_COHERENCE_THRESHOLD = 0.30
@@ -69,7 +88,7 @@ DEFAULT_TOPO_PHASE_CORRECTION = True  # 大气延迟线性修正（与高程线�
 DEFAULT_DEM_TIF_PATH = r"D:\leixiang\D-InSAR\DEM\dem.tif"
 
 # 精度向选项
-DEFAULT_DEM_NAME = "SRTM 1Sec HGT"  # 想和本地一致就改回 "SRTM 3Sec"
+DEFAULT_DEM_NAME = "Copernicus 30m Global DEM"  # 想和本地一致就改回 "SRTM 3Sec"
 DEFAULT_USE_ESD = True  # TOPS 配准增强
 DEFAULT_OUTPUT_MM = True  # 输出毫米（PhaseToDisplacement 通常是米）
 # =========================================================
@@ -202,7 +221,7 @@ XML_STEP2_FILTER = r"""<graph id="Graph">
   <node id="GoldsteinFilter"><operator>GoldsteinPhaseFiltering</operator>
     <sources><sourceProduct refid="TopoPhaseRemoval"/></sources>
     <parameters>
-      <alpha>1.0</alpha>
+      <alpha>0.8</alpha>
       <FFTSizeString>64</FFTSizeString>
       <windowSizeString>3</windowSizeString>
       <useCoherenceMask>false</useCoherenceMask>
@@ -218,8 +237,8 @@ XML_STEP2_FILTER = r"""<graph id="Graph">
     <sources><sourceProduct refid="Subset"/></sources>
     <parameters>
       <targetFolder>${targetFolder}</targetFolder>
-      <statCostMode>DEFO</statCostMode>
-      <initMethod>MCF</initMethod>
+      <statCostMode>SMOOTH</statCostMode>
+      <initMethod>MST</initMethod>
       <numberOfTileCols>10</numberOfTileCols>
       <numberOfTileRows>10</numberOfTileRows>
       <tileCostThreshold>500</tileCostThreshold>
@@ -300,6 +319,18 @@ def validate_environment(config: PipelineConfig) -> None:
         raise FileNotFoundError(f"缺少必要路径/可执行文件:\n{missing_str}")
     if config.topo_phase_correction and not os.path.exists(config.dem_tif_path):
         LOGGER.warning("未找到 DEM_TIF_PATH: %s，将跳过线性高程修正", config.dem_tif_path)
+    check_disk_space(config.project_root, config.required_disk_gb)
+
+
+def check_disk_space(path: str, required_gb: int) -> None:
+    if not os.path.exists(path):
+        path = os.path.dirname(path)
+    usage = shutil.disk_usage(path)
+    free_gb = usage.free / (1024**3)
+    if free_gb < required_gb:
+        raise RuntimeError(
+            f"磁盘剩余空间不足: {free_gb:.1f} GB < {required_gb} GB"
+        )
 
 
 def create_xml_file(template: str, replace_dict: Dict[str, str], out_path: str) -> None:
@@ -311,17 +342,34 @@ def create_xml_file(template: str, replace_dict: Dict[str, str], out_path: str) 
 
 
 def run_gpt(
-    config: PipelineConfig, xml_path: str, task_id: str, work_dir: Optional[str] = None
+    config: PipelineConfig,
+    xml_path: str,
+    task_id: str,
+    work_dir: Optional[str] = None,
+    max_retries: int = 1,
+    retry_sleep_s: int = 10,
 ) -> None:
     os.makedirs(config.temp_dir, exist_ok=True)
-    local_tmp = os.path.join(config.temp_dir, f"java_tmp_{task_id}")
+    base_tmp = os.path.abspath(os.path.join(config.project_root, "gpt_tmp"))
+    local_tmp = os.path.abspath(os.path.join(base_tmp, task_id))
     os.makedirs(local_tmp, exist_ok=True)
+    if not os.path.exists(local_tmp):
+        raise RuntimeError(f"无法创建临时目录: {local_tmp}")
+    time.sleep(0.2)
 
-    java_tmp = local_tmp.replace("\\", "/")
+    java_tmp = os.path.abspath(local_tmp).replace("\\", "/").rstrip("/")
     env = os.environ.copy()
+    java_opts = f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
+    existing_opts = env.get("JAVA_TOOL_OPTIONS", "").strip()
     env["JAVA_TOOL_OPTIONS"] = (
-        f"-Xmx{config.jvm_heap} -Djava.io.tmpdir={java_tmp} -XX:+UseG1GC"
+        f"{existing_opts} {java_opts}".strip() if existing_opts else java_opts
     )
+    env["_JAVA_OPTIONS"] = env["JAVA_TOOL_OPTIONS"]
+    env["TMPDIR"] = java_tmp
+    env["TMP"] = java_tmp
+    env["TEMP"] = java_tmp
+    env["JBLAS_HOME"] = java_tmp
+    normalize_env_paths(env)
 
     log_path = os.path.join(config.temp_dir, f"gpt_{task_id}.log")
     cmd = [
@@ -331,22 +379,42 @@ def run_gpt(
         str(config.threads_per_worker),
         "-c",
         config.tile_cache,
+        "-x",
     ]
 
-    with open(log_path, "w", encoding="utf-8") as log:
-        p = subprocess.run(
-            cmd,
-            cwd=work_dir,
-            env=env,
-            stdout=log,
-            stderr=log,
-            check=False,
+    attempt = 0
+    while True:
+        attempt += 1
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(f"\n=== GPT attempt {attempt}/{max_retries + 1} ===\n")
+            p = subprocess.run(
+                cmd,
+                cwd=work_dir,
+                env=env,
+                stdout=log,
+                stderr=log,
+                check=False,
+            )
+
+        if p.returncode == 0:
+            break
+        if attempt > max_retries:
+            break
+        LOGGER.warning(
+            "GPT 失败(%s) attempt %s/%s，%ss 后重试",
+            task_id,
+            attempt,
+            max_retries + 1,
+            retry_sleep_s,
         )
+        time.sleep(retry_sleep_s)
 
     shutil.rmtree(local_tmp, ignore_errors=True)
 
     if p.returncode != 0:
-        raise RuntimeError(f"GPT 失败({task_id})，查看日志: {log_path}")
+        raise RuntimeError(
+            f"GPT 失败({task_id})，退出码 {p.returncode}，查看日志: {log_path}"
+        )
 
 
 def load_status(status_path: str) -> Dict[str, Any]:
@@ -376,6 +444,161 @@ def compute_stats(arr: np.ndarray) -> Dict[str, float]:
         "mean": float(np.mean(data)),
         "std": float(np.std(data)),
     }
+
+
+def parse_size_to_bytes(size_value: str) -> int:
+    match = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?B?)\s*$", size_value, re.I)
+    if not match:
+        raise ValueError(f"无法解析大小字符串: {size_value}")
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    if unit in ("K", "KB"):
+        factor = 1024
+    elif unit in ("M", "MB"):
+        factor = 1024**2
+    elif unit in ("G", "GB", ""):
+        factor = 1024**3
+    elif unit in ("T", "TB"):
+        factor = 1024**4
+    else:
+        raise ValueError(f"未知单位: {unit}")
+    return int(value * factor)
+
+
+def normalize_tile_cache(jvm_heap: str, tile_cache: str) -> str:
+    heap_bytes = parse_size_to_bytes(jvm_heap)
+    cache_bytes = parse_size_to_bytes(tile_cache)
+    if cache_bytes >= heap_bytes:
+        adjusted = int(heap_bytes * 0.6)
+        adjusted_gb = max(adjusted // (1024**3), 1)
+        return f"{adjusted_gb}G"
+    return tile_cache
+
+
+def bytes_to_gb(value: float) -> int:
+    return max(int(value // (1024**3)), 1)
+
+
+def compute_memory_settings(max_workers: int) -> Tuple[str, str, int]:
+    available_bytes = psutil.virtual_memory().available
+    per_task_bytes = max(available_bytes * 0.4, 4 * 1024**3)
+    dynamic_max = max(1, int(available_bytes // per_task_bytes))
+    adjusted_max_workers = min(max_workers, dynamic_max)
+    jvm_heap_gb = max(int(per_task_bytes // (1024**3)), 4)
+    tile_cache_gb = max(int(jvm_heap_gb * 0.6), 1)
+    return f"{jvm_heap_gb}G", f"{tile_cache_gb}G", adjusted_max_workers
+
+
+def normalize_env_paths(env: Dict[str, str]) -> None:
+    for key in ("PATH", "JBLAS_HOME", "JBLAS_PATH"):
+        if key in env and env[key]:
+            env[key] = env[key].replace("\\", "/")
+
+
+def read_incidence_angle(tif_path: str, fallback: float) -> float:
+    try:
+        with rasterio.open(tif_path) as src:
+            tags = src.tags()
+        for key in ("incidence_angle", "incidenceAngle", "INCIDENCE_ANGLE"):
+            if key in tags:
+                return float(tags[key])
+    except (ValueError, rasterio.errors.RasterioIOError):
+        return fallback
+    return fallback
+
+
+def read_perpendicular_baseline(tif_path: str) -> float:
+    try:
+        with rasterio.open(tif_path) as src:
+            tags = src.tags()
+        for key in ("perpendicular_baseline", "B_PERP", "b_perp", "BPERP"):
+            if key in tags:
+                return float(tags[key])
+    except (ValueError, rasterio.errors.RasterioIOError):
+        return 0.0
+    return 0.0
+
+
+def select_reference_point(
+    coherence_stack: List[np.ndarray],
+    dem: Optional[np.ndarray],
+    coherence_percentile: float,
+) -> Optional[Tuple[int, int]]:
+    if not coherence_stack:
+        return None
+    mean_coh = np.nanmean(np.stack(coherence_stack, axis=0), axis=0)
+    if dem is None:
+        threshold = np.nanpercentile(mean_coh, coherence_percentile)
+        candidates = np.where(mean_coh >= threshold)
+        if candidates[0].size == 0:
+            return None
+        return int(candidates[0][0]), int(candidates[1][0])
+
+    grad_y, grad_x = np.gradient(dem)
+    slope = np.hypot(grad_x, grad_y)
+    threshold = np.nanpercentile(mean_coh, coherence_percentile)
+    candidates = np.where(mean_coh >= threshold)
+    if candidates[0].size == 0:
+        return None
+    cand_slopes = slope[candidates]
+    idx = int(np.nanargmin(cand_slopes))
+    return int(candidates[0][idx]), int(candidates[1][idx])
+
+
+def apply_atmospheric_filter(
+    disp: np.ndarray, mask: np.ndarray, block_size: int
+) -> np.ndarray:
+    if block_size <= 1:
+        return disp
+    h, w = disp.shape
+    bh = max(1, block_size)
+    bw = max(1, block_size)
+    pad_h = (bh - (h % bh)) % bh
+    pad_w = (bw - (w % bw)) % bw
+    padded = np.pad(disp, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=np.nan)
+    padded_mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
+    reshaped = padded.reshape((padded.shape[0] // bh, bh, padded.shape[1] // bw, bw))
+    mask_reshaped = padded_mask.reshape(
+        (padded_mask.shape[0] // bh, bh, padded_mask.shape[1] // bw, bw)
+    )
+    block_vals = np.where(mask_reshaped, reshaped, np.nan)
+    block_median = np.nanmedian(block_vals, axis=(1, 3))
+    expanded = np.repeat(np.repeat(block_median, bh, axis=0), bw, axis=1)
+    expanded = expanded[:h, :w]
+    return disp - expanded
+
+
+def build_reliability_mask(
+    disp: np.ndarray,
+    coherence: Optional[np.ndarray],
+    coherence_threshold: float,
+    gradient_threshold: float,
+) -> np.ndarray:
+    mask = np.ones(disp.shape, dtype=bool)
+    if coherence is not None:
+        mask &= coherence >= coherence_threshold
+    grad_x = np.abs(disp - np.roll(disp, 1, axis=1))
+    grad_y = np.abs(disp - np.roll(disp, 1, axis=0))
+    grad = np.maximum(grad_x, grad_y)
+    mask &= grad <= gradient_threshold
+    return mask
+
+
+def robust_weighted_stack(
+    disp_stack: np.ndarray,
+    weight_stack: np.ndarray,
+    mad_threshold: float,
+) -> np.ndarray:
+    median = np.nanmedian(disp_stack, axis=0)
+    mad = np.nanmedian(np.abs(disp_stack - median), axis=0)
+    mad = np.where(mad == 0, np.nan, mad)
+    deviation = np.abs(disp_stack - median)
+    valid = deviation <= (mad_threshold * mad)
+    weights = np.where(valid, weight_stack, 0.0)
+    weighted_sum = np.nansum(disp_stack * weights, axis=0)
+    weight_sum = np.nansum(weights, axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(weight_sum > 0, weighted_sum / weight_sum, np.nan)
 
 
 def remove_planar_ramp(
@@ -493,13 +716,128 @@ def analyze_all_subswaths(zip_path: str, shp_path: str):
     return tasks, wkt
 
 
+def validate_input_zip(zip_path: str) -> None:
+    try:
+        with zipfile.ZipFile(zip_path) as zip_file:
+            bad_member = zip_file.testzip()
+            if bad_member:
+                raise zipfile.BadZipFile(f"坏文件成员: {bad_member}")
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"ZIP 文件损坏: {zip_path} ({exc})") from exc
+
+
+def build_sbas_pairs(
+    dated_files: List[Tuple[datetime.datetime, str]], max_baseline_days: int
+) -> List[Tuple[datetime.datetime, datetime.datetime]]:
+    pairs = []
+    for i, (m_date, _) in enumerate(dated_files):
+        for s_date, _ in dated_files[i + 1 :]:
+            if (s_date - m_date).days <= max_baseline_days:
+                pairs.append((m_date, s_date))
+            else:
+                break
+    return pairs
+
+
+def load_disp_for_reference(
+    disp_path: str,
+    ref_shape: Tuple[int, int],
+    ref_transform,
+    ref_crs,
+    incidence_angle: float,
+) -> np.ndarray:
+    with rasterio.open(disp_path) as src:
+        disp = np.full(ref_shape, np.nan, dtype=np.float32)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=disp,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            resampling=Resampling.bilinear,
+        )
+    angle_cos = cos(radians(incidence_angle))
+    if angle_cos == 0:
+        angle_cos = cos(radians(DEFAULT_INCIDENCE_ANGLE))
+    return disp / angle_cos
+
+
+def preload_disp_cache(
+    pairs: List[Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]]
+) -> Dict[Tuple[datetime.datetime, datetime.datetime], np.ndarray]:
+    if not pairs:
+        return {}
+    with rasterio.open(pairs[0][2]) as src:
+        ref_shape = (src.height, src.width)
+        ref_transform = src.transform
+        ref_crs = src.crs
+
+    disp_cache: Dict[Tuple[datetime.datetime, datetime.datetime], np.ndarray] = {}
+    for m_date, s_date, disp_path, _ in pairs:
+        incidence_angle = read_incidence_angle(disp_path, DEFAULT_INCIDENCE_ANGLE)
+        disp_cache[(m_date, s_date)] = load_disp_for_reference(
+            disp_path, ref_shape, ref_transform, ref_crs, incidence_angle
+        )
+    return disp_cache
+
+
+def filter_pairs_by_loop_closure(
+    pairs: List[Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]],
+    threshold_mm: float,
+    disp_cache: Optional[Dict[Tuple[datetime.datetime, datetime.datetime], np.ndarray]] = None,
+) -> List[Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]]:
+    if len(pairs) < 3:
+        return pairs
+
+    if disp_cache is None:
+        disp_cache = preload_disp_cache(pairs)
+
+    pair_set = {(m_date, s_date) for m_date, s_date, _, _ in pairs}
+    dates = sorted({d for pair in pair_set for d in pair})
+    bad_pairs = set()
+    threshold_m = threshold_mm / 1000.0
+    for i, a in enumerate(dates):
+        for j in range(i + 1, len(dates)):
+            b = dates[j]
+            for k in range(j + 1, len(dates)):
+                c = dates[k]
+                triplet = (a, b), (b, c), (a, c)
+                if not all(pair in pair_set for pair in triplet):
+                    continue
+                disp_ab = disp_cache[(a, b)]
+                disp_bc = disp_cache[(b, c)]
+                disp_ac = disp_cache[(a, c)]
+                closure = disp_ab + disp_bc - disp_ac
+                valid = np.isfinite(closure)
+                if not np.any(valid):
+                    continue
+                score = np.nanmedian(np.abs(closure[valid]))
+                if score > threshold_m:
+                    bad_pairs.update(triplet)
+
+    filtered = [item for item in pairs if (item[0], item[1]) not in bad_pairs]
+    return filtered if filtered else pairs
+
+
 def preprocess_one(
     config: PipelineConfig, zip_file: str, subswath: str, s_burst: int, e_burst: int
 ) -> str:
-    os.makedirs(config.temp_dir, exist_ok=True)
+    cache_dir = os.path.join(config.project_root, "Preprocessed_Cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    validate_input_zip(zip_file)
     base = os.path.splitext(os.path.basename(zip_file))[0]
-    out_dim = os.path.join(config.temp_dir, f"{base}_{subswath}_Split_Orb.dim")
+    out_dim = os.path.join(cache_dir, f"{base}_{subswath}_Split_Orb.dim")
     if os.path.exists(out_dim) and os.path.exists(out_dim.replace(".dim", ".data")):
+        LOGGER.info("预处理缓存命中: %s", os.path.basename(out_dim))
+        return out_dim
+
+    legacy_dim = os.path.join(config.temp_dir, f"{base}_{subswath}_Split_Orb.dim")
+    legacy_data = legacy_dim.replace(".dim", ".data")
+    if os.path.exists(legacy_dim) and os.path.exists(legacy_data):
+        shutil.move(legacy_dim, out_dim)
+        shutil.move(legacy_data, out_dim.replace(".dim", ".data"))
+        LOGGER.info("迁移预处理缓存: %s", os.path.basename(out_dim))
         return out_dim
 
     xml_path = os.path.join(config.temp_dir, f"run_prep_{base}_{subswath}.xml")
@@ -544,7 +882,17 @@ def fix_snaphu_conf(conf: str, work_dir: str) -> None:
     coh_name = os.path.basename(coh[0]) if coh else None
 
     new_lines = []
+    has_init_method = False
+    has_cost_thresh = False
     for l in lines:
+        if l.strip().startswith("INITMETHOD"):
+            new_lines.append("INITMETHOD MST\n")
+            has_init_method = True
+            continue
+        if l.strip().startswith("COSTTHRESH"):
+            new_lines.append("COSTTHRESH 600\n")
+            has_cost_thresh = True
+            continue
         if "NTILEROW" in l or "NTILECOL" in l:
             new_lines.append(l.split()[0] + " 1\n")
             continue
@@ -559,6 +907,11 @@ def fix_snaphu_conf(conf: str, work_dir: str) -> None:
             continue
         new_lines.append(l)
 
+    if not has_init_method:
+        new_lines.append("INITMETHOD MST\n")
+    if not has_cost_thresh:
+        new_lines.append("COSTTHRESH 600\n")
+
     with open(conf, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
 
@@ -571,7 +924,7 @@ def run_pair(
     m_dim: str,
     s_dim: str,
     wkt: str,
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]:
     pair_name = f"{swath}_{m_date.strftime('%Y%m%d')}_{s_date.strftime('%Y%m%d')}"
     pair_dir = os.path.join(config.output_dir, pair_name)
     os.makedirs(pair_dir, exist_ok=True)
@@ -707,23 +1060,22 @@ def run_pair(
         except Exception:
             coh_tif = None
 
-    return disp_tif, coh_tif
+    return m_date, s_date, disp_tif, coh_tif
 
 
 def calc_cumulative(
-    config: PipelineConfig, tif_pairs: List[Tuple[str, Optional[str]]], out_name: str
-) -> Tuple[Optional[str], Dict[str, float]]:
+    config: PipelineConfig,
+    tif_pairs: List[Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]],
+    out_name: str,
+) -> Tuple[Optional[str], Optional[str], Dict[str, float], Dict[str, float]]:
     if not tif_pairs:
-        return None, {}
+        return None, None, {}, {}
 
-    with rasterio.open(tif_pairs[0][0]) as src0:
+    with rasterio.open(tif_pairs[0][2]) as src0:
         ref_meta = src0.meta.copy()
         ref_crs = src0.crs
         ref_trans = src0.transform
         h, w = src0.height, src0.width
-
-    cum = np.zeros((h, w), dtype=np.float32)
-    weight_sum = np.zeros((h, w), dtype=np.float32)
 
     dem = None
     if config.topo_phase_correction and os.path.exists(config.dem_tif_path):
@@ -741,7 +1093,22 @@ def calc_cumulative(
     elif config.topo_phase_correction:
         LOGGER.warning("未找到 DEM_TIF_PATH，跳过线性高程修正")
 
-    for disp_path, coh_path in tif_pairs:
+    dates = sorted({d for pair in tif_pairs for d in pair[:2]})
+    date_index = {date: idx for idx, date in enumerate(dates)}
+    n_dates = len(dates)
+    n_pairs = len(tif_pairs)
+
+    disp_stack: List[np.ndarray] = []
+    weight_stack: List[np.ndarray] = []
+    coherence_stack: List[np.ndarray] = []
+    baseline_vector = np.zeros(n_pairs, dtype=np.float32)
+
+    for idx, (m_date, s_date, disp_path, coh_path) in enumerate(tif_pairs):
+        incidence_angle = read_incidence_angle(disp_path, config.incidence_angle)
+        angle_cos = cos(radians(incidence_angle))
+        if angle_cos == 0:
+            angle_cos = cos(radians(config.incidence_angle))
+
         with rasterio.open(disp_path) as src:
             disp = np.full((h, w), np.nan, dtype=np.float32)
             reproject(
@@ -753,8 +1120,9 @@ def calc_cumulative(
                 dst_crs=ref_crs,
                 resampling=Resampling.bilinear,
             )
+        disp = disp / angle_cos
 
-        mask = np.ones((h, w), dtype=bool)
+        coherence = None
         if coh_path and os.path.exists(coh_path):
             with rasterio.open(coh_path) as src:
                 coh = np.zeros((h, w), dtype=np.float32)
@@ -767,7 +1135,15 @@ def calc_cumulative(
                     dst_crs=ref_crs,
                     resampling=Resampling.bilinear,
                 )
-            mask = coh >= config.coherence_threshold
+            coherence = coh
+            coherence_stack.append(coh)
+
+        mask = build_reliability_mask(
+            disp,
+            coherence,
+            config.coherence_threshold,
+            config.jump_gradient_threshold,
+        )
 
         if dem is not None:
             disp = linear_topo_phase_correction(
@@ -775,41 +1151,116 @@ def calc_cumulative(
             )
 
         disp = remove_planar_ramp(disp, mask, config.orbital_ramp_removal)
+        disp = apply_atmospheric_filter(
+            disp, mask, config.atm_filter_block_size
+        )
 
         weights = np.ones((h, w), dtype=np.float32)
-        if config.weighted_stacking and coh_path and os.path.exists(coh_path):
-            weights = coh
+        if config.weighted_stacking and coherence is not None:
+            weights = np.square(np.clip(coherence, 0.0, 1.0))
         weights[~mask] = 0.0
         disp[~mask] = np.nan
 
-        valid = np.isfinite(disp) & (weights > 0)
-        if config.weighted_stacking:
-            cum[valid] += disp[valid] * weights[valid]
-            weight_sum[valid] += weights[valid]
-        else:
-            cum[valid] += disp[valid]
-            weight_sum[valid] += 1.0
+        disp_stack.append(disp)
+        weight_stack.append(weights)
+        baseline_vector[idx] = read_perpendicular_baseline(disp_path)
 
-    if config.weighted_stacking:
-        with np.errstate(invalid="ignore", divide="ignore"):
-            cum = np.where(weight_sum > 0, cum / weight_sum, np.nan)
-    else:
-        cum = np.where(weight_sum > 0, cum, np.nan)
+    reference = select_reference_point(
+        coherence_stack, dem, config.reference_coherence_percentile
+    )
+    if reference:
+        r, c = reference
+        for i in range(n_pairs):
+            ref_val = disp_stack[i][r, c]
+            if np.isfinite(ref_val):
+                disp_stack[i] = disp_stack[i] - ref_val
 
-    vert = cum / np.cos(np.deg2rad(config.incidence_angle))
+    disp_cube = np.stack(disp_stack, axis=0)
+    weight_cube = np.stack(weight_stack, axis=0)
+
+    A = np.zeros((n_pairs, n_dates), dtype=np.float32)
+    for i, (m_date, s_date, _, _) in enumerate(tif_pairs):
+        mi = date_index[m_date]
+        si = date_index[s_date]
+        if mi > 0:
+            A[i, mi] = -1.0
+        if si > 0:
+            A[i, si] = 1.0
+    A = np.concatenate([A[:, 1:], baseline_vector[:, None]], axis=1)
+
+    times = np.array([(d - dates[0]).days / 365.25 for d in dates], dtype=np.float32)
+    times = times[1:]
+
+    rate = np.full((h, w), np.nan, dtype=np.float32)
+    cumulative_disp = np.full((h, w), np.nan, dtype=np.float32)
+    for row in range(h):
+        for col in range(w):
+            L = disp_cube[:, row, col]
+            W = weight_cube[:, row, col]
+            valid = np.isfinite(L) & (W > 0)
+            if np.count_nonzero(valid) < max(3, A.shape[1]):
+                continue
+            A_valid = A[valid]
+            L_valid = L[valid]
+            W_sqrt = np.sqrt(W[valid])
+            Aw = A_valid * W_sqrt[:, None]
+            Lw = L_valid * W_sqrt
+            try:
+                x, _, _, _ = np.linalg.lstsq(Aw, Lw, rcond=None)
+            except np.linalg.LinAlgError:
+                continue
+            displacements = x[:-1]
+            if displacements.size == 0:
+                continue
+            cumulative_disp[row, col] = displacements[-1]
+            if displacements.size != times.size:
+                continue
+            if config.robust_estimation:
+                median = np.nanmedian(displacements)
+                mad = np.nanmedian(np.abs(displacements - median))
+                if mad > 0:
+                    mask = np.abs(displacements - median) <= (
+                        config.robust_mad_threshold * mad
+                    )
+                    if np.any(mask):
+                        displacements = displacements[mask]
+                        t_sel = times[mask]
+                    else:
+                        t_sel = times
+                else:
+                    t_sel = times
+            else:
+                t_sel = times
+            if displacements.size < 2:
+                continue
+            A_rate = np.vstack([t_sel, np.ones_like(t_sel)]).T
+            rate_params, _, _, _ = np.linalg.lstsq(A_rate, displacements, rcond=None)
+            rate[row, col] = rate_params[0]
+
+    if config.output_mm:
+        rate = rate * 1000.0
+        cumulative_disp = cumulative_disp * 1000.0
+        out_name = out_name.replace(".tif", "_mm_per_year.tif")
 
     nodata = -9999.0
-    if config.output_mm:
-        vert = vert * 1000.0
-        out_name = out_name.replace(".tif", "_mm.tif")
-
-    out = np.where(np.isnan(vert), nodata, vert).astype(np.float32)
+    out = np.where(np.isnan(rate), nodata, rate).astype(np.float32)
+    cum_out = np.where(np.isnan(cumulative_disp), nodata, cumulative_disp).astype(
+        np.float32
+    )
 
     ref_meta.update(dtype=rasterio.float32, count=1, nodata=nodata, compress="deflate")
     out_path = os.path.join(config.output_dir, out_name)
     with rasterio.open(out_path, "w", **ref_meta) as dst:
         dst.write(out, 1)
-    return out_path, compute_stats(vert)
+    cumulative_name = (
+        "Final_Combined_Cumulative_Subsidence_mm.tif"
+        if config.output_mm
+        else "Final_Combined_Cumulative_Subsidence.tif"
+    )
+    cumulative_path = os.path.join(config.output_dir, cumulative_name)
+    with rasterio.open(cumulative_path, "w", **ref_meta) as dst:
+        dst.write(cum_out, 1)
+    return out_path, cumulative_path, compute_stats(rate), compute_stats(cumulative_disp)
 
 
 def mosaic_results(
@@ -848,11 +1299,64 @@ def main() -> None:
     parser.add_argument("--dem-tif-path", default=DEFAULT_DEM_TIF_PATH)
     parser.add_argument("--run-id", default=datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_CPU_TASKS)
+    parser.add_argument(
+        "--max-temporal-baseline",
+        type=int,
+        default=DEFAULT_MAX_TEMPORAL_BASELINE_DAYS,
+        help="SBAS 网络最大时间基线（天）",
+    )
+    parser.add_argument(
+        "--required-disk-gb",
+        type=int,
+        default=DEFAULT_REQUIRED_DISK_GB,
+        help="磁盘预检所需最小剩余空间（GB）",
+    )
+    parser.add_argument(
+        "--loop-closure-threshold-mm",
+        type=float,
+        default=DEFAULT_LOOP_CLOSURE_THRESHOLD_MM,
+        help="闭合差阈值（毫米）",
+    )
+    parser.add_argument(
+        "--atm-filter-block-size",
+        type=int,
+        default=DEFAULT_ATM_FILTER_BLOCK_SIZE,
+        help="大气滤波空间块大小（像素）",
+    )
+    parser.add_argument(
+        "--jump-gradient-threshold",
+        type=float,
+        default=DEFAULT_JUMP_GRADIENT_THRESHOLD,
+        help="解缠跳变梯度阈值（位移幅度）",
+    )
+    parser.add_argument(
+        "--no-robust-estimation",
+        action="store_false",
+        dest="robust_estimation",
+        default=DEFAULT_ROBUST_ESTIMATION,
+        help="禁用稳健估计（MAD 剔除）",
+    )
+    parser.add_argument(
+        "--robust-mad-threshold",
+        type=float,
+        default=DEFAULT_ROBUST_MAD_THRESHOLD,
+        help="MAD 异常剔除倍数",
+    )
+    parser.add_argument(
+        "--reference-coherence-percentile",
+        type=float,
+        default=DEFAULT_REFERENCE_COHERENCE_PERCENTILE,
+        help="参考点选择的平均相干性分位数",
+    )
     args = parser.parse_args()
 
     output_base_dir = os.path.join(args.project_root, "Output")
     output_dir = os.path.join(output_base_dir, args.run_id)
     temp_dir = os.path.join(output_dir, "Temp_Preprocessed")
+    jvm_heap, tile_cache, adjusted_max_workers = compute_memory_settings(
+        args.max_workers
+    )
+    tile_cache = normalize_tile_cache(jvm_heap, tile_cache)
     config = PipelineConfig(
         input_dir=args.input_dir,
         shp_path=args.shp_path,
@@ -862,10 +1366,10 @@ def main() -> None:
         temp_dir=temp_dir,
         gpt_path=args.gpt_path,
         snaphu_cmd=args.snaphu_cmd,
-        max_cpu_tasks=args.max_workers,
+        max_cpu_tasks=adjusted_max_workers,
         threads_per_worker=DEFAULT_THREADS_PER_WORKER,
-        jvm_heap=DEFAULT_JVM_HEAP,
-        tile_cache=DEFAULT_TILE_CACHE,
+        jvm_heap=jvm_heap,
+        tile_cache=tile_cache,
         incidence_angle=DEFAULT_INCIDENCE_ANGLE,
         coherence_threshold=DEFAULT_COHERENCE_THRESHOLD,
         weighted_stacking=DEFAULT_WEIGHTED_STACKING,
@@ -875,9 +1379,20 @@ def main() -> None:
         dem_name=DEFAULT_DEM_NAME,
         use_esd=DEFAULT_USE_ESD,
         output_mm=DEFAULT_OUTPUT_MM,
+        required_disk_gb=args.required_disk_gb,
+        max_temporal_baseline_days=args.max_temporal_baseline,
+        loop_closure_threshold_mm=args.loop_closure_threshold_mm,
+        atm_filter_block_size=args.atm_filter_block_size,
+        jump_gradient_threshold=args.jump_gradient_threshold,
+        robust_estimation=args.robust_estimation,
+        robust_mad_threshold=args.robust_mad_threshold,
+        reference_coherence_percentile=args.reference_coherence_percentile,
     )
 
     setup_logging(os.path.join(config.output_dir, "logs"), args.run_id)
+    if adjusted_max_workers != args.max_workers:
+        LOGGER.info("调整 max_workers: %s -> %s", args.max_workers, adjusted_max_workers)
+    LOGGER.info("JVM_HEAP=%s TILE_CACHE=%s", jvm_heap, tile_cache)
     validate_environment(config)
     os.makedirs(config.output_dir, exist_ok=True)
     os.makedirs(config.temp_dir, exist_ok=True)
@@ -893,7 +1408,7 @@ def main() -> None:
         LOGGER.error("影像不足 2 景")
         return
 
-    LOGGER.info("🔍 [Phase 0] 分析覆盖条带 & Burst...")
+    LOGGER.info("[Phase 0] 分析覆盖条带 & Burst...")
     tasks, wkt = analyze_all_subswaths(file_map[0][1], config.shp_path)
     if not tasks:
         LOGGER.error("SHP 与影像无交集或元数据读取失败")
@@ -905,12 +1420,12 @@ def main() -> None:
     for task in tasks:
         swath = task["swath"]
         s_burst, e_burst = task["s"], task["e"]
-        LOGGER.info("🌊 === 条带 %s Burst %s-%s ===", swath, s_burst, e_burst)
+        LOGGER.info("=== 条带 %s Burst %s-%s ===", swath, s_burst, e_burst)
 
         pre_map = {}
         for d, z in file_map:
             LOGGER.info(
-                "⚙️ 预处理: %s | %s | Burst %s-%s",
+                "预处理: %s | %s | Burst %s-%s",
                 d.strftime("%Y%m%d"),
                 swath,
                 s_burst,
@@ -918,10 +1433,16 @@ def main() -> None:
             )
             pre_map[d] = preprocess_one(config, z, swath, s_burst, e_burst)
 
-        pairs = [(file_map[i][0], file_map[i + 1][0]) for i in range(len(file_map) - 1)]
+        pairs = build_sbas_pairs(file_map, config.max_temporal_baseline_days)
+        if not pairs:
+            LOGGER.warning("未生成任何配对，请检查 max_temporal_baseline 设置")
+            continue
         tif_pairs: List[Tuple[str, Optional[str]]] = []
+        tif_pairs_with_dates: List[
+            Tuple[datetime.datetime, datetime.datetime, str, Optional[str]]
+        ] = []
 
-        LOGGER.info("🚀 [Phase 2] 干涉计算并行（max_workers=%s）...", config.max_cpu_tasks)
+        LOGGER.info("[Phase 2] 干涉计算并行（max_workers=%s）...", config.max_cpu_tasks)
         with ProcessPoolExecutor(max_workers=config.max_cpu_tasks) as ex:
             futs = []
             for m, s in pairs:
@@ -931,26 +1452,40 @@ def main() -> None:
 
             for f in as_completed(futs):
                 try:
-                    disp_tif, coh_tif = f.result()
-                    tif_pairs.append((disp_tif, coh_tif))
-                    LOGGER.info("✅ 完成: %s", os.path.basename(disp_tif))
+                    m_date, s_date, disp_tif, coh_tif = f.result()
+                    tif_pairs_with_dates.append((m_date, s_date, disp_tif, coh_tif))
+                    LOGGER.info("完成: %s", os.path.basename(disp_tif))
                 except Exception as e:
-                    LOGGER.exception("❌ pair 失败: %s", e)
+                    LOGGER.exception("pair 失败: %s", e)
 
-        tif_pairs = sorted(tif_pairs, key=lambda x: x[0])
-        swath_out, stats = calc_cumulative(
-            config, tif_pairs, f"Total_Subsidence_{swath}.tif"
+        disp_cache = preload_disp_cache(tif_pairs_with_dates)
+        filtered_pairs = filter_pairs_by_loop_closure(
+            tif_pairs_with_dates, config.loop_closure_threshold_mm, disp_cache
+        )
+        if len(filtered_pairs) < len(tif_pairs_with_dates):
+            LOGGER.warning(
+                "闭合差剔除 %s/%s 个干涉对",
+                len(tif_pairs_with_dates) - len(filtered_pairs),
+                len(tif_pairs_with_dates),
+            )
+        swath_out, cumulative_out, stats, cumulative_stats = calc_cumulative(
+            config, filtered_pairs, f"Total_Subsidence_{swath}.tif"
         )
         if swath_out:
-            LOGGER.info("🎉 条带累计完成: %s", swath_out)
+            LOGGER.info("条带累计完成: %s", swath_out)
             swath_final_tifs.append(swath_out)
-            quality_report["swaths"][swath] = {"path": swath_out, "stats": stats}
+            quality_report["swaths"][swath] = {
+                "path": swath_out,
+                "stats": stats,
+                "cumulative_path": cumulative_out,
+                "cumulative_stats": cumulative_stats,
+            }
 
     final, final_stats = mosaic_results(
         config, swath_final_tifs, "Final_Combined_Subsidence_Vertical_Masked.tif"
     )
     if final:
-        LOGGER.info("🏆 最终拼接完成: %s", final)
+        LOGGER.info("最终拼接完成: %s", final)
         quality_report["final"] = {"path": final, "stats": final_stats}
     else:
         LOGGER.warning("未生成最终结果")
